@@ -27,6 +27,8 @@ def add_hybrid_attn_args(parser):
                         help="是否对 routed expert 做 MXFP4/MXFP8 伪量化 QAT")
     parser.add_argument('--use_vision', default=0, type=int, choices=[0, 1],
                         help="是否构建 MoonViT-V2 视觉塔（需同时传入 pixel_values）")
+    parser.add_argument('--kda_use_triton', default=1, type=int, choices=[0, 1],
+                        help="KDA 在 CUDA+Triton 可用时走 fused recurrent；未安装则自动回退 PyTorch")
 
 
 def hybrid_attn_kwargs(args):
@@ -38,6 +40,8 @@ def hybrid_attn_kwargs(args):
         kwargs['use_qat'] = bool(args.use_qat)
     if hasattr(args, 'use_vision'):
         kwargs['use_vision'] = bool(args.use_vision)
+    if hasattr(args, 'kda_use_triton'):
+        kwargs['kda_use_triton'] = bool(args.kda_use_triton)
     return kwargs
 
 def get_model_params(model, config):

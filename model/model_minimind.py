@@ -36,6 +36,7 @@ class MiniMindConfig(PretrainedConfig):
             kda_gate_lower_bound: float = -5.0,
             kda_chunk_size: int = 16,
             kda_use_wy_scan: bool = True,
+            kda_use_triton: bool = True,
             kda_context_parallel_size: int = 1,
             mla_kv_lora_rank: int = None,
             mla_qk_nope_head_dim: int = None,
@@ -102,6 +103,7 @@ class MiniMindConfig(PretrainedConfig):
         self.kda_gate_lower_bound = kda_gate_lower_bound
         self.kda_chunk_size = kda_chunk_size
         self.kda_use_wy_scan = kda_use_wy_scan
+        self.kda_use_triton = kda_use_triton
         self.kda_context_parallel_size = kda_context_parallel_size
         head_dim = hidden_size // num_attention_heads
         self.mla_kv_lora_rank = mla_kv_lora_rank if mla_kv_lora_rank is not None else max(head_dim, hidden_size // 8)
@@ -480,6 +482,7 @@ class KimiDeltaAttention(nn.Module):
         self.gate_lower_bound = args.kda_gate_lower_bound
         self.chunk_size = args.kda_chunk_size
         self.use_wy_scan = args.kda_use_wy_scan
+        self.use_triton = getattr(args, 'kda_use_triton', True)
         self.context_parallel_size = args.kda_context_parallel_size
         self.attn_type = "kda"
 
@@ -527,6 +530,7 @@ class KimiDeltaAttention(nn.Module):
             chunk_size=self.chunk_size,
             use_wy_scan=self.use_wy_scan,
             context_parallel_size=self.context_parallel_size,
+            use_triton=self.use_triton,
         )
 
         past_kv = None

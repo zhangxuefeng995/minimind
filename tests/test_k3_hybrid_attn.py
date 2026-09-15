@@ -150,6 +150,29 @@ def test_wy_scan_matches_naive():
     assert torch.allclose(s_n, s_cp, atol=1e-4, rtol=1e-4)
 
 
+def test_triton_is_optional_python_fallback():
+    """没装 Triton / 没有 CUDA 时必须安静回退，不能 import 失败。"""
+    from model.k3_triton import HAS_TRITON, kda_delta_rule_scan_triton, kda_triton_is_available
+    from model.k3_ops import kda_delta_rule_scan_naive, kda_delta_rule_scan
+    q = torch.nn.functional.normalize(torch.randn(1, 1, 4, 8), dim=-1)
+    k = torch.nn.functional.normalize(torch.randn(1, 1, 4, 8), dim=-1)
+    v = torch.randn(1, 1, 4, 8)
+    g = -torch.rand(1, 1, 4, 8)
+    b = torch.rand(1, 1, 4)
+    if not kda_triton_is_available(q):
+        assert kda_delta_rule_scan_triton(q, k, v, g, b) is None
+        o_a, s_a = kda_delta_rule_scan(q, k, v, g, b, use_triton=True)
+        o_b, s_b = kda_delta_rule_scan_naive(q, k, v, g, b)
+        assert torch.allclose(o_a, o_b, atol=1e-4, rtol=1e-4)
+        assert torch.allclose(s_a, s_b, atol=1e-4, rtol=1e-4)
+        return
+    o_t, s_t = kda_delta_rule_scan_triton(q.cuda(), k.cuda(), v.cuda(), g.cuda(), b.cuda())
+    o_n, s_n = kda_delta_rule_scan_naive(q.cuda(), k.cuda(), v.cuda(), g.cuda(), b.cuda())
+    assert torch.allclose(o_t, o_n, atol=2e-4, rtol=2e-4)
+    assert torch.allclose(s_t, s_n, atol=2e-4, rtol=2e-4)
+    _ = HAS_TRITON
+
+
 def test_quantile_balancing_eval_freezes_bias():
     model = MiniMindForCausalLM(_tiny_config(use_hybrid_attn=True, use_moe=True))
     gate = model.model.layers[0].mlp.gate
@@ -223,6 +246,7 @@ if __name__ == '__main__':
         test_k3_bounded_forget_gate,
         test_latent_moe_hybrid,
         test_wy_scan_matches_naive,
+        test_triton_is_optional_python_fallback,
         test_quantile_balancing_eval_freezes_bias,
         test_qat_routed_expert_forward,
         test_per_head_muon_step,

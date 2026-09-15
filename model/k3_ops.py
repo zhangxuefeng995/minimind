@@ -1,7 +1,9 @@
 """Kimi-K3 相关算子：KDA 的 WY/UT 分块扫描、Context Parallel 模拟、MXFP QAT。
 
-本文件是 MiniMind 规模的纯 PyTorch 实现，对应 Kimi Linear / K3 论文中的算法骨架，
-而不是 2.8T 训练栈里的 Triton/CUDA kernel、NCCL 1M Context Parallel 或真实 MX 硬件量化。
+本文件是 MiniMind 规模的实现：默认纯 PyTorch WY/UT；
+若环境里有 CUDA + Triton，则推理时走可选 fused recurrent（见 ``k3_triton.py``），
+缺依赖时自动回退，不破坏 CPU / 原训练路径。
+官方 FLA 的完整 WY Tensor Core kernel 仍未作为硬依赖接入。
 """
 
 from __future__ import annotations
@@ -174,6 +176,33 @@ def kda_delta_rule_scan_wy(
     return output.to(orig_dtype), state.to(orig_dtype)
 
 
+def _kda_try_triton(
+    q, k, v, log_decay, beta, initial_state, attention_mask, use_triton: bool
+):
+    """有 CUDA+Triton 且当前张量不需要反传时，走 fused recurrent。
+
+    训练仍用下面的 PyTorch WY：Triton 这边没有手写 backward，
+    强行 JIT 前向会破坏现有 autograd；推理加速则正好避开这个问题。
+    """
+    if not use_triton:
+        return None
+    needs_grad = any(
+        t is not None and torch.is_tensor(t) and t.requires_grad
+        for t in (q, k, v, log_decay, beta, initial_state)
+    )
+    if needs_grad:
+        return None
+    try:
+        from model.k3_triton import kda_delta_rule_scan_triton
+        return kda_delta_rule_scan_triton(
+            q, k, v, log_decay, beta,
+            initial_state=initial_state,
+            attention_mask=attention_mask,
+        )
+    except Exception:
+        return None
+
+
 def kda_delta_rule_scan(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -185,15 +214,23 @@ def kda_delta_rule_scan(
     chunk_size: int = 16,
     use_wy_scan: bool = True,
     context_parallel_size: int = 1,
+    use_triton: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """KDA 扫描入口。
 
-    - ``seq_len==1``：走逐步递推（解码 / KV-RNN 状态）。
+    - 可选 Triton：CUDA 上、无梯度时把 token 循环编译进 GPU（源码仍是 Python DSL）。
+    - ``seq_len==1``：逐步递推（解码 / KV-RNN 状态）。
     - ``use_wy_scan``：训练/预填使用 WY/UT 分块，避免 Python 扫完整 T。
     - ``context_parallel_size>1``：把序列切成若干段，**段间顺序传递 S**。
       这是 K3 在多卡 Context Parallel（1M 上下文、NCCL 传状态）上的单卡等价物：
       代数上与一次扫完整序列相同，并不实现跨卡 all-to-all。
     """
+    triton_out = _kda_try_triton(
+        q, k, v, log_decay, beta, initial_state, attention_mask, use_triton
+    )
+    if triton_out is not None:
+        return triton_out
+
     seq_len = q.shape[2]
     if seq_len == 1 or not use_wy_scan:
         return kda_delta_rule_scan_naive(
