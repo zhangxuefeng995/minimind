@@ -26,6 +26,13 @@ class MiniMindConfig(PretrainedConfig):
             inference_rope_scaling: bool = False,
             flash_attn: bool = True,
             ####################################################
+            # Hybrid attention: Kimi-K3 style (3 KDA + 1 full attention)
+            # Each KDA layer owns independent QKVO / conv / gate parameters
+            ####################################################
+            use_hybrid_attn: bool = False,
+            linear_attn_ratio: int = 3,
+            kda_conv_kernel_size: int = 4,
+            ####################################################
             # Here are the specific configurations of MOE
             # When use_moe is false, the following is invalid
             ####################################################
@@ -64,6 +71,9 @@ class MiniMindConfig(PretrainedConfig):
             "type": "yarn"
         } if self.inference_rope_scaling else None
         self.flash_attn = flash_attn
+        self.use_hybrid_attn = use_hybrid_attn
+        self.linear_attn_ratio = linear_attn_ratio
+        self.kda_conv_kernel_size = kda_conv_kernel_size
         ####################################################
         # Here are the specific configurations of MOE
         # When use_moe is false, the following is invalid
@@ -76,6 +86,21 @@ class MiniMindConfig(PretrainedConfig):
         self.aux_loss_alpha = aux_loss_alpha  # 辅助损失的alpha参数
         self.seq_aux = seq_aux  # 是否在序列级别上计算辅助损失
         self.norm_topk_prob = norm_topk_prob  # 是否标准化top-k概率
+
+    def is_kda_layer(self, layer_id: int) -> bool:
+        """Kimi-K3 grouping: `linear_attn_ratio` KDA layers, then 1 full-attn layer.
+        The last layer is always full attention. Remainder layers stay full attention.
+        """
+        if not self.use_hybrid_attn:
+            return False
+        if layer_id == self.num_hidden_layers - 1:
+            return False
+        ratio = max(int(self.linear_attn_ratio), 0)
+        group = ratio + 1
+        n_complete = (self.num_hidden_layers // group) * group
+        if layer_id >= n_complete:
+            return False
+        return (layer_id % group) != ratio
 
 
 # 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
@@ -147,6 +172,43 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
+def infer_cache_start_pos(past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]]) -> int:
+    """RoPE offset from full-attn KV cache; KDA layers keep a recurrent state instead of KV."""
+    if not past_key_values or past_key_values[0] is None:
+        return 0
+    for pkv in past_key_values:
+        if pkv is None:
+            continue
+        cache_a, cache_b = pkv[0], pkv[1]
+        # Full attention KV: both tensors share shape [B, seq, n_kv_heads, head_dim]
+        if cache_a.dim() == 4 and cache_b.dim() == 4 and cache_a.shape == cache_b.shape:
+            return cache_a.shape[1]
+    return 0
+
+
+class ShortConvolution(nn.Module):
+    """Causal depthwise conv used by Kimi-K3 KDA (kernel size 4 + SiLU)."""
+
+    def __init__(self, hidden_size: int, kernel_size: int = 4, activation: str = 'silu'):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.activation = activation
+        self.conv = nn.Conv1d(hidden_size, hidden_size, kernel_size, groups=hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor, cache: Optional[torch.Tensor] = None):
+        bsz, seq_len, hidden = x.shape
+        x_c = x.transpose(1, 2)
+        if cache is None:
+            cache = x_c.new_zeros(bsz, hidden, self.kernel_size - 1)
+        x_c = torch.cat([cache, x_c], dim=-1)
+        y = F.conv1d(x_c, self.conv.weight, bias=self.conv.bias, groups=self.conv.groups)
+        new_cache = x_c[:, :, -(self.kernel_size - 1):]
+        y = y.transpose(1, 2)
+        if self.activation == 'silu':
+            y = F.silu(y)
+        return y, new_cache
+
+
 class Attention(nn.Module):
     def __init__(self, args: MiniMindConfig):
         super().__init__()
@@ -165,6 +227,7 @@ class Attention(nn.Module):
         self.dropout = args.dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
         # print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+        self.attn_type = "full"
 
     def forward(self,
                 x: torch.Tensor,
@@ -209,6 +272,126 @@ class Attention(nn.Module):
             output = scores @ xv
 
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output))
+        return output, past_kv
+
+
+def l2_normalize(x: torch.Tensor, eps: float = 1e-6):
+    return x * torch.rsqrt(x.pow(2).sum(dim=-1, keepdim=True) + eps)
+
+
+def kda_delta_rule_scan(q, k, v, log_decay, beta, initial_state=None, attention_mask=None):
+    """Kimi-K3 KDA recurrence in PyTorch:
+    S_t = (I - β_t k_t k_t^T) Diag(α_t) S_{t-1} + β_t k_t v_t^T,  o_t = S_t^T q_t
+    with α_t = exp(log_decay_t). q/k/v: [B, H, T, D]
+    """
+    orig_dtype = q.dtype
+    bsz, n_heads, seq_len, dim = q.shape
+    q, k, v = q.float(), k.float(), v.float()
+    alpha = torch.exp(log_decay.float())
+    beta = beta.float()
+    state = initial_state.float() if initial_state is not None else q.new_zeros(bsz, n_heads, dim, dim)
+    outputs = q.new_empty(bsz, n_heads, seq_len, dim)
+    for t in range(seq_len):
+        kt, vt, qt = k[:, :, t], v[:, :, t], q[:, :, t]
+        new_state = state * alpha[:, :, t].unsqueeze(-1)
+        k_state = torch.einsum('bhd,bhde->bhe', kt, new_state)
+        b_t = beta[:, :, t]
+        new_state = new_state - b_t[..., None, None] * torch.einsum('bhd,bhe->bhde', kt, k_state)
+        new_state = new_state + b_t[..., None, None] * torch.einsum('bhd,bhe->bhde', kt, vt)
+        if attention_mask is not None:
+            keep = attention_mask[:, t].view(bsz, 1, 1, 1).to(dtype=new_state.dtype)
+            new_state = keep * new_state + (1.0 - keep) * state
+        state = new_state
+        outputs[:, :, t] = torch.einsum('bhd,bhde->bhe', qt, state)
+    return outputs.to(orig_dtype), state.to(orig_dtype)
+
+
+class KimiDeltaAttention(nn.Module):
+    """Kimi-K3 KDA: independent QKVO, short conv, channel-wise forget gate, delta rule.
+
+    Matches the original MiniMind layer layout (each layer owns its projections) rather than
+    sharing weights with the full-attention layer.
+    """
+
+    def __init__(self, args: MiniMindConfig):
+        super().__init__()
+        self.n_heads = args.num_attention_heads
+        self.head_dim = args.hidden_size // args.num_attention_heads
+        self.hidden_size = args.hidden_size
+        proj_size = self.n_heads * self.head_dim
+        conv_kernel = args.kda_conv_kernel_size
+
+        self.q_proj = nn.Linear(args.hidden_size, proj_size, bias=False)
+        self.k_proj = nn.Linear(args.hidden_size, proj_size, bias=False)
+        self.v_proj = nn.Linear(args.hidden_size, proj_size, bias=False)
+        self.q_conv1d = ShortConvolution(proj_size, kernel_size=conv_kernel, activation='silu')
+        self.k_conv1d = ShortConvolution(proj_size, kernel_size=conv_kernel, activation='silu')
+        self.v_conv1d = ShortConvolution(proj_size, kernel_size=conv_kernel, activation='silu')
+
+        self.A_log = nn.Parameter(torch.log(torch.empty(self.n_heads).uniform_(1, 16)))
+        self.f_a_proj = nn.Linear(args.hidden_size, self.head_dim, bias=False)
+        self.f_b_proj = nn.Linear(self.head_dim, proj_size, bias=False)
+        dt = torch.exp(
+            torch.rand(proj_size) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)
+        ).clamp(min=1e-4)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        self.dt_bias = nn.Parameter(inv_dt)
+        self.b_proj = nn.Linear(args.hidden_size, self.n_heads, bias=False)
+
+        self.g_a_proj = nn.Linear(args.hidden_size, self.head_dim, bias=False)
+        self.g_b_proj = nn.Linear(self.head_dim, proj_size, bias=False)
+        self.o_norm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.o_proj = nn.Linear(proj_size, args.hidden_size, bias=False)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.attn_type = "kda"
+
+    def _forget_gate(self, x: torch.Tensor):
+        g = self.f_b_proj(self.f_a_proj(x))
+        g = g.view(*x.shape[:2], self.n_heads, self.head_dim)
+        dt_bias = self.dt_bias.view(self.n_heads, self.head_dim)
+        # α = exp(-exp(A_log) * softplus(g + dt_bias)), log-space decay
+        log_decay = -self.A_log.float().exp().view(1, 1, self.n_heads, 1) * F.softplus(g.float() + dt_bias)
+        return log_decay
+
+    def forward(self,
+                x: torch.Tensor,
+                position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+                past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                use_cache=False,
+                attention_mask: Optional[torch.Tensor] = None):
+        bsz, seq_len, _ = x.shape
+        conv_q = conv_k = conv_v = None
+        recurrent_state = None
+        if past_key_value is not None:
+            recurrent_state, conv_pack = past_key_value
+            conv_q, conv_k, conv_v = conv_pack.unbind(dim=1)
+
+        q, conv_q = self.q_conv1d(self.q_proj(x), cache=conv_q)
+        k, conv_k = self.k_conv1d(self.k_proj(x), cache=conv_k)
+        v, conv_v = self.v_conv1d(self.v_proj(x), cache=conv_v)
+
+        q = l2_normalize(q.view(bsz, seq_len, self.n_heads, self.head_dim)).transpose(1, 2)
+        k = l2_normalize(k.view(bsz, seq_len, self.n_heads, self.head_dim)).transpose(1, 2)
+        v = v.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+
+        log_decay = self._forget_gate(x).transpose(1, 2)  # [B, H, T, D]
+        beta = torch.sigmoid(self.b_proj(x)).transpose(1, 2)  # [B, H, T]
+        output, state = kda_delta_rule_scan(
+            q, k, v, log_decay, beta,
+            initial_state=recurrent_state,
+            attention_mask=attention_mask
+        )
+
+        past_kv = None
+        if use_cache:
+            conv_pack = torch.stack([conv_q, conv_k, conv_v], dim=1)
+            past_kv = (state, conv_pack)
+
+        output = output.transpose(1, 2)
+        g_out = self.g_b_proj(self.g_a_proj(x)).view(bsz, seq_len, self.n_heads, self.head_dim)
+        output = self.o_norm(output) * torch.sigmoid(g_out)
+        output = output.reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
 
@@ -355,7 +538,10 @@ class MiniMindBlock(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.head_dim = config.hidden_size // config.num_attention_heads
-        self.self_attn = Attention(config)
+        if config.is_kda_layer(layer_id):
+            self.self_attn = KimiDeltaAttention(config)
+        else:
+            self.self_attn = Attention(config)
 
         self.layer_id = layer_id
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -398,7 +584,7 @@ class MiniMindModel(nn.Module):
         batch_size, seq_length = input_ids.shape
         if hasattr(past_key_values, 'layers'): past_key_values = None
         past_key_values = past_key_values or [None] * len(self.layers)
-        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        start_pos = infer_cache_start_pos(past_key_values)
 
         hidden_states = self.dropout(self.embed_tokens(input_ids))
 

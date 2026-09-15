@@ -15,6 +15,20 @@ from torch.utils.data import Sampler
 from transformers import AutoTokenizer
 from model.model_minimind import MiniMindForCausalLM
 
+HYBRID_ATTN_ARG_HELP = "是否启用Kimi-K3风格混合注意力（3层KDA+1层全注意力；KDA层独立参数，默认0）"
+
+
+def add_hybrid_attn_args(parser):
+    parser.add_argument('--use_hybrid_attn', default=0, type=int, choices=[0, 1], help=HYBRID_ATTN_ARG_HELP)
+    parser.add_argument('--linear_attn_ratio', default=3, type=int, help="每组中KDA层数（默认3，即3:1）")
+
+
+def hybrid_attn_kwargs(args):
+    return dict(
+        use_hybrid_attn=bool(getattr(args, 'use_hybrid_attn', 0)),
+        linear_attn_ratio=int(getattr(args, 'linear_attn_ratio', 3)),
+    )
+
 def get_model_params(model, config):
     total = sum(p.numel() for p in model.parameters()) / 1e6
     n_routed = getattr(config, 'n_routed_experts', getattr(config, 'num_experts', 0))
