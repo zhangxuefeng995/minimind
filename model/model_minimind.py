@@ -32,6 +32,14 @@ class MiniMindConfig(PretrainedConfig):
             use_hybrid_attn: bool = False,
             linear_attn_ratio: int = 3,
             kda_conv_kernel_size: int = 4,
+            kda_gate_lower_bound: float = -5.0,
+            kda_chunk_size: int = 16,
+            mla_kv_lora_rank: int = None,
+            mla_qk_nope_head_dim: int = None,
+            mla_v_head_dim: int = None,
+            use_attn_res: bool = None,
+            attn_res_block_size: int = 4,
+            latent_moe_dim: int = None,
             ####################################################
             # Here are the specific configurations of MOE
             # When use_moe is false, the following is invalid
@@ -74,6 +82,15 @@ class MiniMindConfig(PretrainedConfig):
         self.use_hybrid_attn = use_hybrid_attn
         self.linear_attn_ratio = linear_attn_ratio
         self.kda_conv_kernel_size = kda_conv_kernel_size
+        self.kda_gate_lower_bound = kda_gate_lower_bound
+        self.kda_chunk_size = kda_chunk_size
+        head_dim = hidden_size // num_attention_heads
+        self.mla_kv_lora_rank = mla_kv_lora_rank if mla_kv_lora_rank is not None else max(head_dim, hidden_size // 8)
+        self.mla_qk_nope_head_dim = mla_qk_nope_head_dim if mla_qk_nope_head_dim is not None else head_dim
+        self.mla_v_head_dim = mla_v_head_dim if mla_v_head_dim is not None else head_dim
+        self.use_attn_res = use_hybrid_attn if use_attn_res is None else use_attn_res
+        self.attn_res_block_size = attn_res_block_size
+        self.latent_moe_dim = latent_moe_dim
         ####################################################
         # Here are the specific configurations of MOE
         # When use_moe is false, the following is invalid
@@ -86,6 +103,8 @@ class MiniMindConfig(PretrainedConfig):
         self.aux_loss_alpha = aux_loss_alpha  # 辅助损失的alpha参数
         self.seq_aux = seq_aux  # 是否在序列级别上计算辅助损失
         self.norm_topk_prob = norm_topk_prob  # 是否标准化top-k概率
+        if self.latent_moe_dim is None and self.use_hybrid_attn and self.use_moe:
+            self.latent_moe_dim = max(64, hidden_size // 2)
 
     def is_kda_layer(self, layer_id: int) -> bool:
         """Kimi-K3 grouping: `linear_attn_ratio` KDA layers, then 1 full-attn layer.
@@ -276,14 +295,89 @@ class Attention(nn.Module):
         return output, past_kv
 
 
+class GatedMLA(nn.Module):
+    """Kimi-K3 Gated MLA: latent KV compression, NoPE, full-rank output gate."""
+
+    def __init__(self, args: MiniMindConfig):
+        super().__init__()
+        self.n_heads = args.num_attention_heads
+        self.qk_nope_head_dim = args.mla_qk_nope_head_dim
+        self.v_head_dim = args.mla_v_head_dim
+        self.kv_lora_rank = args.mla_kv_lora_rank
+        self.dropout = args.dropout
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
+        self.q_proj = nn.Linear(args.hidden_size, self.n_heads * self.qk_nope_head_dim, bias=False)
+        self.kv_a_proj = nn.Linear(args.hidden_size, self.kv_lora_rank, bias=False)
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=args.rms_norm_eps)
+        self.kv_b_proj = nn.Linear(
+            self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False
+        )
+        self.g_proj = nn.Linear(args.hidden_size, self.n_heads * self.v_head_dim, bias=False)
+        self.o_proj = nn.Linear(self.n_heads * self.v_head_dim, args.hidden_size, bias=False)
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.attn_type = "mla"
+
+    def forward(self,
+                x: torch.Tensor,
+                position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+                past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                use_cache=False,
+                attention_mask: Optional[torch.Tensor] = None):
+        bsz, seq_len, _ = x.shape
+        q = self.q_proj(x).view(bsz, seq_len, self.n_heads, self.qk_nope_head_dim)
+        compressed = self.kv_a_layernorm(self.kv_a_proj(x))
+        kv = self.kv_b_proj(compressed).view(bsz, seq_len, self.n_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        # NoPE: KDA carries position; MLA is global content attention
+
+        if past_key_value is not None:
+            k = torch.cat([past_key_value[0], k], dim=1)
+            v = torch.cat([past_key_value[1], v], dim=1)
+        past_kv = (k, v) if use_cache else None
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        kv_seq = k.shape[-2]
+        if self.flash and (seq_len > 1) and (past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+            output = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=self.dropout if self.training else 0.0, is_causal=True, scale=self.qk_nope_head_dim ** -0.5
+            )
+        else:
+            scores = (q @ k.transpose(-2, -1)) * (self.qk_nope_head_dim ** -0.5)
+            causal = torch.ones(seq_len, kv_seq, device=scores.device, dtype=torch.bool).tril(diagonal=kv_seq - seq_len)
+            scores = scores.masked_fill(~causal, float('-inf'))
+            if attention_mask is not None:
+                scores = scores + (1.0 - attention_mask[:, None, None, :].to(scores.dtype)) * -1e9
+            scores = F.softmax(scores.float(), dim=-1).type_as(q)
+            scores = self.attn_dropout(scores)
+            output = scores @ v
+
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = output * torch.sigmoid(self.g_proj(x))
+        output = self.resid_dropout(self.o_proj(output))
+        return output, past_kv
+
+
+def apply_attn_res(prefix_sum: torch.Tensor, block_residual: torch.Tensor, proj: nn.Linear, norm: RMSNorm):
+    """Block AttnRes: softmax over [previous blocks; current prefix] with a learned pseudo-query."""
+    v = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
+    v_float = v.float()
+    k = v_float * torch.rsqrt(v_float.pow(2).mean(-1, keepdim=True) + norm.eps)
+    score_weight = norm.weight.float() * proj.weight.squeeze(0).float()
+    scores = (k * score_weight).sum(-1)
+    probs = torch.softmax(scores, dim=-1).unsqueeze(1)
+    return torch.matmul(probs, v_float).squeeze(1).to(dtype=v.dtype)
+
+
 def l2_normalize(x: torch.Tensor, eps: float = 1e-6):
     return x * torch.rsqrt(x.pow(2).sum(dim=-1, keepdim=True) + eps)
 
 
-def kda_delta_rule_scan(q, k, v, log_decay, beta, initial_state=None, attention_mask=None):
-    """Kimi-K3 KDA recurrence in PyTorch:
+def kda_delta_rule_scan(q, k, v, log_decay, beta, initial_state=None, attention_mask=None, chunk_size: int = 16):
+    """Kimi-K3 KDA recurrence in PyTorch, scanned chunk-by-chunk:
     S_t = (I - β_t k_t k_t^T) Diag(α_t) S_{t-1} + β_t k_t v_t^T,  o_t = S_t^T q_t
-    with α_t = exp(log_decay_t). q/k/v: [B, H, T, D]
     """
     orig_dtype = q.dtype
     bsz, n_heads, seq_len, dim = q.shape
@@ -292,18 +386,21 @@ def kda_delta_rule_scan(q, k, v, log_decay, beta, initial_state=None, attention_
     beta = beta.float()
     state = initial_state.float() if initial_state is not None else q.new_zeros(bsz, n_heads, dim, dim)
     outputs = q.new_empty(bsz, n_heads, seq_len, dim)
-    for t in range(seq_len):
-        kt, vt, qt = k[:, :, t], v[:, :, t], q[:, :, t]
-        new_state = state * alpha[:, :, t].unsqueeze(-1)
-        k_state = torch.einsum('bhd,bhde->bhe', kt, new_state)
-        b_t = beta[:, :, t]
-        new_state = new_state - b_t[..., None, None] * torch.einsum('bhd,bhe->bhde', kt, k_state)
-        new_state = new_state + b_t[..., None, None] * torch.einsum('bhd,bhe->bhde', kt, vt)
-        if attention_mask is not None:
-            keep = attention_mask[:, t].view(bsz, 1, 1, 1).to(dtype=new_state.dtype)
-            new_state = keep * new_state + (1.0 - keep) * state
-        state = new_state
-        outputs[:, :, t] = torch.einsum('bhd,bhde->bhe', qt, state)
+    step = max(int(chunk_size), 1)
+    for t0 in range(0, seq_len, step):
+        t1 = min(t0 + step, seq_len)
+        for t in range(t0, t1):
+            kt, vt, qt = k[:, :, t], v[:, :, t], q[:, :, t]
+            new_state = state * alpha[:, :, t].unsqueeze(-1)
+            k_state = torch.einsum('bhd,bhde->bhe', kt, new_state)
+            b_t = beta[:, :, t]
+            new_state = new_state - b_t[..., None, None] * torch.einsum('bhd,bhe->bhde', kt, k_state)
+            new_state = new_state + b_t[..., None, None] * torch.einsum('bhd,bhe->bhde', kt, vt)
+            if attention_mask is not None:
+                keep = attention_mask[:, t].view(bsz, 1, 1, 1).to(dtype=new_state.dtype)
+                new_state = keep * new_state + (1.0 - keep) * state
+            state = new_state
+            outputs[:, :, t] = torch.einsum('bhd,bhde->bhe', qt, state)
     return outputs.to(orig_dtype), state.to(orig_dtype)
 
 
@@ -344,15 +441,18 @@ class KimiDeltaAttention(nn.Module):
         self.o_norm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.o_proj = nn.Linear(proj_size, args.hidden_size, bias=False)
         self.resid_dropout = nn.Dropout(args.dropout)
+        self.gate_lower_bound = args.kda_gate_lower_bound
+        self.chunk_size = args.kda_chunk_size
         self.attn_type = "kda"
 
     def _forget_gate(self, x: torch.Tensor):
         g = self.f_b_proj(self.f_a_proj(x))
         g = g.view(*x.shape[:2], self.n_heads, self.head_dim)
         dt_bias = self.dt_bias.view(self.n_heads, self.head_dim)
-        # α = exp(-exp(A_log) * softplus(g + dt_bias)), log-space decay
-        log_decay = -self.A_log.float().exp().view(1, 1, self.n_heads, 1) * F.softplus(g.float() + dt_bias)
-        return log_decay
+        z = g.float() + dt_bias
+        # K3 lower-bounded decay: g = g_min * sigmoid(exp(A) * z) ∈ (g_min, 0)
+        a_scale = self.A_log.float().exp().view(1, 1, self.n_heads, 1)
+        return self.gate_lower_bound * torch.sigmoid(a_scale * z)
 
     def forward(self,
                 x: torch.Tensor,
@@ -380,7 +480,8 @@ class KimiDeltaAttention(nn.Module):
         output, state = kda_delta_rule_scan(
             q, k, v, log_decay, beta,
             initial_state=recurrent_state,
-            attention_mask=attention_mask
+            attention_mask=attention_mask,
+            chunk_size=self.chunk_size,
         )
 
         past_kv = None
@@ -397,19 +498,33 @@ class KimiDeltaAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, config: MiniMindConfig):
+    def __init__(self, config: MiniMindConfig, hidden_size: int = None, intermediate_size: int = None, use_situ: bool = False):
         super().__init__()
-        if config.intermediate_size is None:
-            intermediate_size = int(config.hidden_size * 8 / 3)
-            config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        hidden_size = config.hidden_size if hidden_size is None else hidden_size
+        if intermediate_size is None:
+            intermediate_size = int(hidden_size * 8 / 3)
+            intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+            if hidden_size == config.hidden_size and config.intermediate_size is None:
+                config.intermediate_size = intermediate_size
+            elif hidden_size == config.hidden_size:
+                intermediate_size = config.intermediate_size
+        self.hidden_size = hidden_size
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.dropout = nn.Dropout(config.dropout)
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.use_situ = use_situ or config.hidden_act == 'situ'
+        self.act_fn = ACT2FN['silu'] if self.use_situ else ACT2FN[config.hidden_act]
+        self.situ_beta = 1.0
 
     def forward(self, x):
-        return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
+        gate, up = self.gate_proj(x), self.up_proj(x)
+        if self.use_situ:
+            gate_f, up_f = gate.float(), up.float()
+            hidden = (self.situ_beta * torch.tanh(gate_f / self.situ_beta) * torch.sigmoid(gate_f) * up_f).to(x.dtype)
+        else:
+            hidden = self.act_fn(gate) * up
+        return self.dropout(self.down_proj(hidden))
 
 
 class MoEGate(nn.Module):
@@ -472,8 +587,11 @@ class MOEFeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
+        self.latent_dim = config.latent_moe_dim
+        self.use_latent_moe = self.latent_dim is not None and self.latent_dim > 0
+        expert_hidden = self.latent_dim if self.use_latent_moe else config.hidden_size
         self.experts = nn.ModuleList([
-            FeedForward(config)
+            FeedForward(config, hidden_size=expert_hidden, use_situ=self.use_latent_moe)
             for _ in range(config.n_routed_experts)
         ])
         self.gate = MoEGate(config)
@@ -482,6 +600,10 @@ class MOEFeedForward(nn.Module):
                 FeedForward(config)
                 for _ in range(config.n_shared_experts)
             ])
+        if self.use_latent_moe:
+            self.routed_down_proj = nn.Linear(config.hidden_size, self.latent_dim, bias=False)
+            self.routed_up_proj = nn.Linear(self.latent_dim, config.hidden_size, bias=False)
+            self.routed_norm = RMSNorm(self.latent_dim, eps=config.rms_norm_eps)
 
     def forward(self, x):
         identity = x
@@ -490,6 +612,8 @@ class MOEFeedForward(nn.Module):
         # 使用门控机制选择专家
         topk_idx, topk_weight, aux_loss = self.gate(x)
         x = x.view(-1, x.shape[-1])
+        if self.use_latent_moe:
+            x = self.routed_down_proj(x)
         flat_topk_idx = topk_idx.view(-1)
         if self.training:
             x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
@@ -499,9 +623,11 @@ class MOEFeedForward(nn.Module):
                 if expert_out.shape[0] > 0: y[flat_topk_idx == i] = expert_out.to(y.dtype)
                 else: y[flat_topk_idx == i] = expert_out.to(y.dtype) + 0 * sum(p.sum() for p in expert.parameters())
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
-            y = y.view(*orig_shape)
         else:
-            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
+            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1))
+        if self.use_latent_moe:
+            y = self.routed_up_proj(self.routed_norm(y))
+        y = y.view(*orig_shape)
         if self.config.n_shared_experts > 0:
             for expert in self.shared_experts:
                 y = y + expert(identity)
@@ -538,17 +664,31 @@ class MiniMindBlock(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.head_dim = config.hidden_size // config.num_attention_heads
+        self.layer_id = layer_id
+        self.use_attn_res = config.use_attn_res
+        self.attn_res_block_size = config.attn_res_block_size
         if config.is_kda_layer(layer_id):
             self.self_attn = KimiDeltaAttention(config)
+        elif config.use_hybrid_attn:
+            self.self_attn = GatedMLA(config)
         else:
             self.self_attn = Attention(config)
 
-        self.layer_id = layer_id
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+        if self.use_attn_res:
+            self.self_attention_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.mlp_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.self_attention_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
+            self.mlp_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
 
-    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False,
+                attention_mask=None, block_residual=None):
+        if self.use_attn_res:
+            return self._forward_attn_res(
+                hidden_states, position_embeddings, past_key_value, use_cache, attention_mask, block_residual
+            )
         residual = hidden_states
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states), position_embeddings,
@@ -556,7 +696,39 @@ class MiniMindBlock(nn.Module):
         )
         hidden_states += residual
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
-        return hidden_states, present_key_value
+        return hidden_states, present_key_value, block_residual
+
+    def _forward_attn_res(self, hidden_states, position_embeddings, past_key_value, use_cache,
+                          attention_mask, block_residual):
+        batch_size, seq_len, hidden_size = hidden_states.shape
+        prefix_sum = hidden_states
+        if block_residual is not None and block_residual.shape[1] > 0:
+            hidden_states = apply_attn_res(
+                prefix_sum.reshape(-1, hidden_size),
+                block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+            ).view(batch_size, seq_len, hidden_size)
+        if self.layer_id % self.attn_res_block_size == 0:
+            block_residual = torch.cat(
+                [block_residual, prefix_sum.reshape(-1, hidden_size).unsqueeze(1)], dim=1
+            )
+            prefix_sum = None
+
+        attn_out, present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states), position_embeddings,
+            past_key_value, use_cache, attention_mask
+        )
+        prefix_sum = attn_out if prefix_sum is None else prefix_sum + attn_out
+        hidden_states = apply_attn_res(
+            prefix_sum.reshape(-1, hidden_size),
+            block_residual,
+            self.mlp_res_proj,
+            self.mlp_res_norm,
+        ).view(batch_size, seq_len, hidden_size)
+        mlp_out = self.mlp(self.post_attention_layernorm(hidden_states))
+        prefix_sum = mlp_out if prefix_sum is None else prefix_sum + mlp_out
+        return prefix_sum, present_key_value, block_residual
 
 
 class MiniMindModel(nn.Module):
@@ -568,6 +740,10 @@ class MiniMindModel(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.use_attn_res = config.use_attn_res
+        if self.use_attn_res:
+            self.output_attn_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.output_attn_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
 
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
                                                     end=config.max_position_embeddings, rope_base=config.rope_theta,
@@ -594,15 +770,27 @@ class MiniMindModel(nn.Module):
         )
 
         presents = []
+        block_residual = None
+        if self.use_attn_res:
+            block_residual = hidden_states.new_zeros(batch_size * seq_length, 0, self.config.hidden_size)
         for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
-            hidden_states, present = layer(
+            hidden_states, present, block_residual = layer(
                 hidden_states,
                 position_embeddings,
                 past_key_value=past_key_value,
                 use_cache=use_cache,
-                attention_mask=attention_mask
+                attention_mask=attention_mask,
+                block_residual=block_residual,
             )
             presents.append(present)
+
+        if self.use_attn_res:
+            hidden_states = apply_attn_res(
+                hidden_states.reshape(-1, self.config.hidden_size),
+                block_residual,
+                self.output_attn_res_proj,
+                self.output_attn_res_norm,
+            ).view(batch_size, seq_length, -1)
 
         hidden_states = self.norm(hidden_states)
 

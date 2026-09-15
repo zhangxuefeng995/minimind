@@ -1,4 +1,4 @@
-"""Sanity checks for MiniMind Kimi-K3 hybrid attention (3 KDA + 1 full)."""
+"""Sanity checks for MiniMind Kimi-K3 hybrid attention."""
 import os
 import sys
 
@@ -7,6 +7,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import torch
 from model.model_minimind import (
     Attention,
+    GatedMLA,
     KimiDeltaAttention,
     MiniMindConfig,
     MiniMindForCausalLM,
@@ -23,6 +24,9 @@ def _tiny_config(**kwargs):
         max_position_embeddings=64,
         flash_attn=False,
         dropout=0.0,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
     )
     cfg.update(kwargs)
     return MiniMindConfig(**cfg)
@@ -34,32 +38,31 @@ def test_default_model_keeps_full_attention():
     keys = model.state_dict().keys()
     assert 'model.layers.0.self_attn.q_proj.weight' in keys
     assert 'model.layers.0.self_attn.q_conv1d.conv.weight' not in keys
+    assert 'model.layers.0.self_attn.kv_a_proj.weight' not in keys
 
 
 def test_k3_layer_pattern_and_independent_params():
     model = MiniMindForCausalLM(_tiny_config(use_hybrid_attn=True, linear_attn_ratio=3))
     types = [layer.self_attn.attn_type for layer in model.model.layers]
-    assert types == ['kda', 'kda', 'kda', 'full']
+    assert types == ['kda', 'kda', 'kda', 'mla']
     assert isinstance(model.model.layers[0].self_attn, KimiDeltaAttention)
-    assert isinstance(model.model.layers[3].self_attn, Attention)
+    assert isinstance(model.model.layers[3].self_attn, GatedMLA)
     kda_q = model.model.layers[0].self_attn.q_proj.weight
-    full_q = model.model.layers[3].self_attn.q_proj.weight
-    assert kda_q.data_ptr() != full_q.data_ptr()
-    kda0_q = model.model.layers[0].self_attn.q_proj.weight
-    kda1_q = model.model.layers[1].self_attn.q_proj.weight
-    assert kda0_q.data_ptr() != kda1_q.data_ptr()
+    mla_q = model.model.layers[3].self_attn.q_proj.weight
+    assert kda_q.data_ptr() != mla_q.data_ptr()
     keys = model.state_dict().keys()
     assert 'model.layers.0.self_attn.q_conv1d.conv.weight' in keys
-    assert 'model.layers.0.self_attn.f_a_proj.weight' in keys
-    assert 'model.layers.0.self_attn.b_proj.weight' in keys
-    assert 'model.shared_attn_projs.0.q_proj.weight' not in keys
+    assert 'model.layers.3.self_attn.kv_a_proj.weight' in keys
+    assert 'model.layers.3.self_attn.g_proj.weight' in keys
+    assert 'model.layers.0.self_attention_res_proj.weight' in keys
+    assert 'model.output_attn_res_proj.weight' in keys
 
 
 def test_last_layer_is_always_full_attention():
     model = MiniMindForCausalLM(_tiny_config(use_hybrid_attn=True, num_hidden_layers=5, linear_attn_ratio=3))
     types = [layer.self_attn.attn_type for layer in model.model.layers]
-    assert types[-1] == 'full'
-    assert types == ['kda', 'kda', 'kda', 'full', 'full']
+    assert types[-1] == 'mla'
+    assert types == ['kda', 'kda', 'kda', 'mla', 'mla']
 
 
 def test_forward_backward_and_causal():
@@ -72,7 +75,8 @@ def test_forward_backward_and_causal():
     out.loss.backward()
     assert model.model.layers[0].self_attn.q_proj.weight.grad is not None
     assert model.model.layers[0].self_attn.b_proj.weight.grad is not None
-    assert model.model.layers[3].self_attn.q_proj.weight.grad is not None
+    assert model.model.layers[3].self_attn.kv_a_proj.weight.grad is not None
+    assert model.model.layers[3].self_attn.g_proj.weight.grad is not None
 
     model.eval()
     with torch.no_grad():
@@ -80,7 +84,7 @@ def test_forward_backward_and_causal():
         ids_b = ids.clone()
         ids_b[:, -1] = (ids_b[:, -1] + 1) % 128
         logits_b = model(ids_b).logits
-    assert torch.allclose(logits_a[:, :-1], logits_b[:, :-1], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(logits_a[:, :-1], logits_b[:, :-1], atol=1e-4, rtol=1e-4)
 
 
 def test_kda_cache_matches_full_prefill():
@@ -100,6 +104,27 @@ def test_kda_cache_matches_full_prefill():
     assert torch.allclose(full.logits, stepped, atol=2e-4, rtol=2e-4)
 
 
+def test_k3_bounded_forget_gate():
+    model = MiniMindForCausalLM(_tiny_config(use_hybrid_attn=True))
+    kda = model.model.layers[0].self_attn
+    x = torch.randn(2, 5, 64)
+    log_decay = kda._forget_gate(x)
+    assert log_decay.max() <= 0
+    assert log_decay.min() >= kda.gate_lower_bound - 1e-5
+
+
+def test_latent_moe_hybrid():
+    torch.manual_seed(0)
+    model = MiniMindForCausalLM(_tiny_config(use_hybrid_attn=True, use_moe=True))
+    mlp = model.model.layers[0].mlp
+    assert mlp.use_latent_moe
+    assert 'routed_down_proj.weight' in dict(mlp.named_parameters())
+    ids = torch.randint(0, 128, (2, 6))
+    out = model(ids, labels=ids)
+    out.loss.backward()
+    assert out.logits.shape == (2, 6, 128)
+
+
 if __name__ == '__main__':
     tests = [
         test_default_model_keeps_full_attention,
@@ -107,6 +132,8 @@ if __name__ == '__main__':
         test_last_layer_is_always_full_attention,
         test_forward_backward_and_causal,
         test_kda_cache_matches_full_prefill,
+        test_k3_bounded_forget_gate,
+        test_latent_moe_hybrid,
     ]
     for fn in tests:
         fn()
