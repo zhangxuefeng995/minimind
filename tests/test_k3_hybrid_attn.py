@@ -118,11 +118,99 @@ def test_latent_moe_hybrid():
     model = MiniMindForCausalLM(_tiny_config(use_hybrid_attn=True, use_moe=True))
     mlp = model.model.layers[0].mlp
     assert mlp.use_latent_moe
+    assert mlp.gate.use_quantile_balancing
+    assert mlp.experts[0].situ_beta1 == 4.0
+    assert mlp.experts[0].situ_beta2 == 25.0
     assert 'routed_down_proj.weight' in dict(mlp.named_parameters())
     ids = torch.randint(0, 128, (2, 6))
     out = model(ids, labels=ids)
     out.loss.backward()
     assert out.logits.shape == (2, 6, 128)
+    assert mlp.gate.expert_bias.abs().sum() > 0
+
+
+def test_wy_scan_matches_naive():
+    from model.k3_ops import kda_delta_rule_scan_naive, kda_delta_rule_scan_wy, kda_delta_rule_scan
+    torch.manual_seed(0)
+    bsz, heads, seq, dim = 2, 2, 13, 8
+    q = torch.nn.functional.normalize(torch.randn(bsz, heads, seq, dim), dim=-1)
+    k = torch.nn.functional.normalize(torch.randn(bsz, heads, seq, dim), dim=-1)
+    v = torch.randn(bsz, heads, seq, dim)
+    log_decay = -torch.rand(bsz, heads, seq, dim) * 3
+    beta = torch.rand(bsz, heads, seq)
+    state0 = torch.randn(bsz, heads, dim, dim) * 0.05
+    o_n, s_n = kda_delta_rule_scan_naive(q, k, v, log_decay, beta, state0)
+    o_w, s_w = kda_delta_rule_scan_wy(q, k, v, log_decay, beta, state0, chunk_size=4)
+    assert torch.allclose(o_n, o_w, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(s_n, s_w, atol=1e-4, rtol=1e-4)
+    o_cp, s_cp = kda_delta_rule_scan(
+        q, k, v, log_decay, beta, state0, chunk_size=4, use_wy_scan=True, context_parallel_size=5
+    )
+    assert torch.allclose(o_n, o_cp, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(s_n, s_cp, atol=1e-4, rtol=1e-4)
+
+
+def test_quantile_balancing_eval_freezes_bias():
+    model = MiniMindForCausalLM(_tiny_config(use_hybrid_attn=True, use_moe=True))
+    gate = model.model.layers[0].mlp.gate
+    ids = torch.randint(0, 128, (2, 8))
+    model.train()
+    model(ids)
+    bias_after_train = gate.expert_bias.clone()
+    model.eval()
+    with torch.no_grad():
+        model(ids)
+    assert torch.equal(bias_after_train, gate.expert_bias)
+
+
+def test_qat_routed_expert_forward():
+    torch.manual_seed(0)
+    model = MiniMindForCausalLM(_tiny_config(use_hybrid_attn=True, use_moe=True, use_qat=True))
+    assert model.model.layers[0].mlp.experts[0].use_qat
+    assert not model.model.layers[0].mlp.shared_experts[0].use_qat
+    ids = torch.randint(0, 128, (2, 6))
+    out = model(ids, labels=ids)
+    out.loss.backward()
+    assert torch.isfinite(out.loss)
+
+
+def test_per_head_muon_step():
+    from trainer.trainer_utils import PerHeadMuonAdamW
+    torch.manual_seed(0)
+    model = MiniMindForCausalLM(_tiny_config(use_hybrid_attn=True))
+    opt = PerHeadMuonAdamW(model, lr=1e-3)
+    assert len(opt.muon_params) > 0
+    ids = torch.randint(0, 128, (2, 6))
+    out = model(ids, labels=ids)
+    out.loss.backward()
+    q_before = model.model.layers[0].self_attn.q_proj.weight.detach().clone()
+    opt.step()
+    assert not torch.equal(q_before, model.model.layers[0].self_attn.q_proj.weight.detach())
+
+
+def test_moonvit_prepends_vision_tokens():
+    torch.manual_seed(0)
+    cfg = _tiny_config(
+        use_hybrid_attn=True,
+        use_vision=True,
+        vision_hidden_size=32,
+        vision_num_layers=1,
+        vision_num_heads=2,
+        vision_patch_size=8,
+        vision_image_size=16,
+        max_position_embeddings=128,
+    )
+    model = MiniMindForCausalLM(cfg)
+    ids = torch.randint(0, 128, (2, 4))
+    pixels = torch.randn(2, 3, 16, 16)
+    labels = ids.clone()
+    out = model(ids, pixel_values=pixels, labels=labels)
+    # 16/8=2 grid, 2x2 shuffle -> 1 vision token, logits 比纯文本长 1
+    assert out.logits.shape[1] == 5
+    out.loss.backward()
+    videos = torch.randn(2, 2, 3, 16, 16)
+    out_v = model(ids, pixel_values_videos=videos)
+    assert out_v.logits.shape[1] == 4 + 2
 
 
 if __name__ == '__main__':
@@ -134,6 +222,11 @@ if __name__ == '__main__':
         test_kda_cache_matches_full_prefill,
         test_k3_bounded_forget_gate,
         test_latent_moe_hybrid,
+        test_wy_scan_matches_naive,
+        test_quantile_balancing_eval_freezes_bias,
+        test_qat_routed_expert_forward,
+        test_per_head_muon_step,
+        test_moonvit_prepends_vision_tokens,
     ]
     for fn in tests:
         fn()

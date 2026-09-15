@@ -21,13 +21,24 @@ HYBRID_ATTN_ARG_HELP = "是否启用Kimi-K3风格混合注意力（3层KDA+1层�
 def add_hybrid_attn_args(parser):
     parser.add_argument('--use_hybrid_attn', default=0, type=int, choices=[0, 1], help=HYBRID_ATTN_ARG_HELP)
     parser.add_argument('--linear_attn_ratio', default=3, type=int, help="每组中KDA层数（默认3，即3:1）")
+    parser.add_argument('--use_per_head_muon', default=0, type=int, choices=[0, 1],
+                        help="是否对注意力 Q/K/V 按头做 Newton–Schulz Muon（K3 Per-Head Muon）")
+    parser.add_argument('--use_qat', default=0, type=int, choices=[0, 1],
+                        help="是否对 routed expert 做 MXFP4/MXFP8 伪量化 QAT")
+    parser.add_argument('--use_vision', default=0, type=int, choices=[0, 1],
+                        help="是否构建 MoonViT-V2 视觉塔（需同时传入 pixel_values）")
 
 
 def hybrid_attn_kwargs(args):
-    return dict(
+    kwargs = dict(
         use_hybrid_attn=bool(getattr(args, 'use_hybrid_attn', 0)),
         linear_attn_ratio=int(getattr(args, 'linear_attn_ratio', 3)),
     )
+    if hasattr(args, 'use_qat'):
+        kwargs['use_qat'] = bool(args.use_qat)
+    if hasattr(args, 'use_vision'):
+        kwargs['use_vision'] = bool(args.use_vision)
+    return kwargs
 
 def get_model_params(model, config):
     total = sum(p.numel() for p in model.parameters()) / 1e6
@@ -169,3 +180,117 @@ class SkipBatchSampler(Sampler):
     def __len__(self):
         total_batches = (len(self.sampler) + self.batch_size - 1) // self.batch_size
         return max(0, total_batches - self.skip_batches)
+
+
+def newton_schulz_(grad: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """Muon 用的 Newton–Schulz 正交化（近似 zeroth power / SVD 符号函数）。
+
+    把 2D 梯度推到接近半正交，使更新步长与谱范数解耦。K3 的 Per-Head Muon
+    是对 **每个头的 Q/K/V 矩阵** 分别做这一步，而不是整张 [n_heads*d, hidden]。
+    """
+    x = grad.float()
+    x = x / (x.norm() + eps)
+    transposed = x.size(0) > x.size(1)
+    if transposed:
+        x = x.T
+    a, b, c = 3.4445, -4.7750, 2.0315
+    for _ in range(steps):
+        a_mat = x @ x.T
+        x = a * x + (b * a_mat + c * a_mat @ a_mat) @ x
+    if transposed:
+        x = x.T
+    return x.to(dtype=grad.dtype)
+
+
+def _is_per_head_attn_weight(name: str, param: torch.nn.Parameter, n_heads: int) -> bool:
+    if param.ndim != 2 or 'self_attn' not in name or not name.endswith('.weight'):
+        return False
+    if 'conv' in name:
+        return False
+    # 只拆 Q/K/V/O 以及 MLA 的 g_proj / kv_b_proj；kv_a 是共享潜空间，不能按头切
+    leaf = name.rsplit('.', 1)[0].rsplit('.', 1)[-1]
+    if leaf not in ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'g_proj', 'kv_b_proj'):
+        return False
+    return param.shape[0] % n_heads == 0
+
+
+class PerHeadMuonAdamW:
+    """K3 风格混合优化器：注意力投影按头 Muon，其余参数 AdamW。
+
+    Muon 参数仍挂在 AdamW 的 param_groups 里（lr=0），这样 GradScaler.unscale_
+    和梯度裁剪能看见它们；真正的更新在 ``step`` 里用 Newton–Schulz 完成。
+    """
+
+    def __init__(self, model, lr: float, weight_decay: float = 0.1, n_heads: int = None):
+        raw = model.module if hasattr(model, 'module') else model
+        raw = getattr(raw, '_orig_mod', raw)
+        cfg = getattr(raw, 'config', None)
+        n_heads = n_heads or getattr(cfg, 'num_attention_heads', 8)
+        muon_params, adam_params = [], []
+        for name, param in raw.named_parameters():
+            if not param.requires_grad:
+                continue
+            if _is_per_head_attn_weight(name, param, n_heads):
+                muon_params.append(param)
+            else:
+                adam_params.append(param)
+        self.n_heads = n_heads
+        self.muon_params = muon_params
+        if not adam_params:
+            # AdamW 至少需要一个 param group；Muon 全覆盖时仍保留空组供 scaler 接口
+            self.adam = torch.optim.AdamW([{'params': muon_params[:1], 'lr': 0.0, 'weight_decay': 0.0}])
+            groups = []
+        else:
+            self.adam = torch.optim.AdamW(adam_params, lr=lr, weight_decay=weight_decay)
+            groups = list(self.adam.param_groups)
+        if muon_params:
+            groups.append({'params': muon_params, 'lr': lr, 'weight_decay': 0.0})
+        self.param_groups = groups
+
+    def zero_grad(self, set_to_none: bool = True):
+        self.adam.zero_grad(set_to_none=set_to_none)
+        for p in self.muon_params:
+            if p.grad is not None:
+                if set_to_none:
+                    p.grad = None
+                else:
+                    p.grad.zero_()
+
+    def state_dict(self):
+        return {'adam': self.adam.state_dict(), 'n_heads': self.n_heads}
+
+    def load_state_dict(self, state):
+        if isinstance(state, dict) and 'adam' in state:
+            self.adam.load_state_dict(state['adam'])
+        else:
+            self.adam.load_state_dict(state)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        if closure is not None:
+            closure()
+        self.adam.step()
+        for p in self.muon_params:
+            if p.grad is None:
+                continue
+            grad = p.grad
+            n_heads = self.n_heads
+            if grad.shape[0] % n_heads == 0:
+                per_head = grad.shape[0] // n_heads
+                g = grad.view(n_heads, per_head, grad.shape[1])
+                updates = [newton_schulz_(g[h]) for h in range(n_heads)]
+                update = torch.stack(updates, dim=0).view_as(p)
+            else:
+                update = newton_schulz_(grad)
+            scale = max(1.0, (p.shape[1] / max(p.shape[0], 1)) ** 0.5)
+            muon_lr = self.param_groups[-1]['lr'] if self.param_groups else 0.0
+            p.add_(update, alpha=-muon_lr * scale)
+
+
+def build_optimizer(model, args):
+    """默认 AdamW；``--use_per_head_muon 1`` 时对注意力矩阵走 Per-Head Muon。"""
+    lr = args.learning_rate
+    if int(getattr(args, 'use_per_head_muon', 0)) == 1:
+        Logger('Per-Head Muon enabled for attention projections')
+        return PerHeadMuonAdamW(model, lr=lr)
+    return torch.optim.AdamW(model.parameters(), lr=lr)

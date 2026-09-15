@@ -26,20 +26,37 @@ class MiniMindConfig(PretrainedConfig):
             inference_rope_scaling: bool = False,
             flash_attn: bool = True,
             ####################################################
-            # Hybrid attention: Kimi-K3 style (3 KDA + 1 full attention)
-            # Each KDA layer owns independent QKVO / conv / gate parameters
+            # 混合注意力：Kimi-K3 风格（默认 3 层 KDA + 1 层全局 MLA）
+            # KDA 层拥有独立 QKVO / 短卷积 / 通道遗忘门，不与 MLA 共享权重
+            # 下面 WY 扫描、Quantile Balancing、QAT、MoonViT 等也只在显式打开时生效
             ####################################################
             use_hybrid_attn: bool = False,
             linear_attn_ratio: int = 3,
             kda_conv_kernel_size: int = 4,
             kda_gate_lower_bound: float = -5.0,
             kda_chunk_size: int = 16,
+            kda_use_wy_scan: bool = True,
+            kda_context_parallel_size: int = 1,
             mla_kv_lora_rank: int = None,
             mla_qk_nope_head_dim: int = None,
             mla_v_head_dim: int = None,
             use_attn_res: bool = None,
             attn_res_block_size: int = 4,
             latent_moe_dim: int = None,
+            use_quantile_balancing: bool = None,
+            use_qat: bool = False,
+            qat_weight_bits: int = 4,
+            qat_act_bits: int = 8,
+            qat_block_size: int = 32,
+            situ_beta1: float = 4.0,
+            situ_beta2: float = 25.0,
+            use_vision: bool = False,
+            vision_hidden_size: int = 128,
+            vision_num_layers: int = 2,
+            vision_num_heads: int = 4,
+            vision_patch_size: int = 16,
+            vision_image_size: int = 224,
+            vision_num_channels: int = 3,
             ####################################################
             # Here are the specific configurations of MOE
             # When use_moe is false, the following is invalid
@@ -84,6 +101,8 @@ class MiniMindConfig(PretrainedConfig):
         self.kda_conv_kernel_size = kda_conv_kernel_size
         self.kda_gate_lower_bound = kda_gate_lower_bound
         self.kda_chunk_size = kda_chunk_size
+        self.kda_use_wy_scan = kda_use_wy_scan
+        self.kda_context_parallel_size = kda_context_parallel_size
         head_dim = hidden_size // num_attention_heads
         self.mla_kv_lora_rank = mla_kv_lora_rank if mla_kv_lora_rank is not None else max(head_dim, hidden_size // 8)
         self.mla_qk_nope_head_dim = mla_qk_nope_head_dim if mla_qk_nope_head_dim is not None else head_dim
@@ -91,6 +110,25 @@ class MiniMindConfig(PretrainedConfig):
         self.use_attn_res = use_hybrid_attn if use_attn_res is None else use_attn_res
         self.attn_res_block_size = attn_res_block_size
         self.latent_moe_dim = latent_moe_dim
+        self.use_qat = use_qat
+        self.qat_weight_bits = qat_weight_bits
+        self.qat_act_bits = qat_act_bits
+        self.qat_block_size = qat_block_size
+        self.situ_beta1 = situ_beta1
+        self.situ_beta2 = situ_beta2
+        self.use_vision = use_vision
+        self.vision_hidden_size = vision_hidden_size
+        self.vision_num_layers = vision_num_layers
+        self.vision_num_heads = vision_num_heads
+        self.vision_patch_size = vision_patch_size
+        self.vision_image_size = vision_image_size
+        self.vision_num_channels = vision_num_channels
+        # 混合注意力 + MoE 时默认走 K3 的 Quantile Balancing；原版 MiniMind MoE 仍用 softmax+aux
+        if use_quantile_balancing is None:
+            use_quantile_balancing = bool(use_hybrid_attn and use_moe)
+        self.use_quantile_balancing = use_quantile_balancing
+        if self.use_quantile_balancing:
+            self.scoring_func = 'sigmoid'
         ####################################################
         # Here are the specific configurations of MOE
         # When use_moe is false, the following is invalid
@@ -99,7 +137,8 @@ class MiniMindConfig(PretrainedConfig):
         self.num_experts_per_tok = num_experts_per_tok  # 每个token选择的专家数量
         self.n_routed_experts = n_routed_experts  # 总的专家数量
         self.n_shared_experts = n_shared_experts  # 共享专家
-        self.scoring_func = scoring_func  # 评分函数，默认为'softmax'
+        if not self.use_quantile_balancing:
+            self.scoring_func = scoring_func  # 评分函数，默认为'softmax'
         self.aux_loss_alpha = aux_loss_alpha  # 辅助损失的alpha参数
         self.seq_aux = seq_aux  # 是否在序列级别上计算辅助损失
         self.norm_topk_prob = norm_topk_prob  # 是否标准化top-k概率
@@ -107,8 +146,10 @@ class MiniMindConfig(PretrainedConfig):
             self.latent_moe_dim = max(64, hidden_size // 2)
 
     def is_kda_layer(self, layer_id: int) -> bool:
-        """Kimi-K3 grouping: `linear_attn_ratio` KDA layers, then 1 full-attn layer.
-        The last layer is always full attention. Remainder layers stay full attention.
+        """Kimi-K3 的层排布：每组 ``linear_attn_ratio`` 层 KDA + 1 层全局注意力。
+
+        最后一层强制为全局注意力（MLA）；凑不齐一组的余数层也保持全局注意力。
+        ``use_hybrid_attn=False`` 时全部仍是原版 GQA，权重布局与旧 checkpoint 兼容。
         """
         if not self.use_hybrid_attn:
             return False
@@ -135,6 +176,7 @@ from transformers.activations import ACT2FN
 from typing import Optional, Tuple, List, Union
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from model.k3_ops import kda_delta_rule_scan, qat_linear
 
 
 class RMSNorm(torch.nn.Module):
@@ -206,7 +248,11 @@ def infer_cache_start_pos(past_key_values: Optional[List[Tuple[torch.Tensor, tor
 
 
 class ShortConvolution(nn.Module):
-    """Causal depthwise conv used by Kimi-K3 KDA (kernel size 4 + SiLU)."""
+    """KDA 的因果深度可分离短卷积（K3 / Kimi Linear：kernel=4 + SiLU）。
+
+    对 Q/K/V 在投影之后、L2Norm 之前做局部混合，让线性注意力也能看见邻近 token。
+    ``cache`` 保存最后 ``kernel_size-1`` 步，解码时与预填等价。
+    """
 
     def __init__(self, hidden_size: int, kernel_size: int = 4, activation: str = 'silu'):
         super().__init__()
@@ -296,7 +342,13 @@ class Attention(nn.Module):
 
 
 class GatedMLA(nn.Module):
-    """Kimi-K3 Gated MLA: latent KV compression, NoPE, full-rank output gate."""
+    """Kimi-K3 的 Gated MLA：KV 潜空间压缩 + NoPE + 满秩输出门。
+
+    混合注意力里「全局层」用这个，而不是原版 GQA+RoPE：
+    - ``kv_a_proj`` 把 KV 压到 ``mla_kv_lora_rank``，RMSNorm 后再 ``kv_b_proj`` 展开成 K/V；
+    - Q 仍按头投影；KDA 已经带了位置信息，所以这里 **不做 RoPE（NoPE）**；
+    - ``g_proj`` 对注意力输出做 sigmoid 门控，再 ``o_proj`` 回到 hidden。
+    """
 
     def __init__(self, args: MiniMindConfig):
         super().__init__()
@@ -329,7 +381,7 @@ class GatedMLA(nn.Module):
         compressed = self.kv_a_layernorm(self.kv_a_proj(x))
         kv = self.kv_b_proj(compressed).view(bsz, seq_len, self.n_heads, self.qk_nope_head_dim + self.v_head_dim)
         k, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        # NoPE: KDA carries position; MLA is global content attention
+        # NoPE：位置由同一组里的 KDA 承担；MLA 只做全局内容检索
 
         if past_key_value is not None:
             k = torch.cat([past_key_value[0], k], dim=1)
@@ -361,7 +413,11 @@ class GatedMLA(nn.Module):
 
 
 def apply_attn_res(prefix_sum: torch.Tensor, block_residual: torch.Tensor, proj: nn.Linear, norm: RMSNorm):
-    """Block AttnRes: softmax over [previous blocks; current prefix] with a learned pseudo-query."""
+    """Block AttnRes：用可学习伪 query 对「历史 block 摘要 + 当前前缀和」做 softmax 混合。
+
+    K3 每隔 ``attn_res_block_size`` 层把当前残差前缀登记进 ``block_residual``，
+    后续层不再用普通 skip，而是注意力式地读取这些 block 记忆，减轻深堆叠时的梯度稀释。
+    """
     v = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
     v_float = v.float()
     k = v_float * torch.rsqrt(v_float.pow(2).mean(-1, keepdim=True) + norm.eps)
@@ -375,40 +431,20 @@ def l2_normalize(x: torch.Tensor, eps: float = 1e-6):
     return x * torch.rsqrt(x.pow(2).sum(dim=-1, keepdim=True) + eps)
 
 
-def kda_delta_rule_scan(q, k, v, log_decay, beta, initial_state=None, attention_mask=None, chunk_size: int = 16):
-    """Kimi-K3 KDA recurrence in PyTorch, scanned chunk-by-chunk:
-    S_t = (I - β_t k_t k_t^T) Diag(α_t) S_{t-1} + β_t k_t v_t^T,  o_t = S_t^T q_t
-    """
-    orig_dtype = q.dtype
-    bsz, n_heads, seq_len, dim = q.shape
-    q, k, v = q.float(), k.float(), v.float()
-    alpha = torch.exp(log_decay.float())
-    beta = beta.float()
-    state = initial_state.float() if initial_state is not None else q.new_zeros(bsz, n_heads, dim, dim)
-    outputs = q.new_empty(bsz, n_heads, seq_len, dim)
-    step = max(int(chunk_size), 1)
-    for t0 in range(0, seq_len, step):
-        t1 = min(t0 + step, seq_len)
-        for t in range(t0, t1):
-            kt, vt, qt = k[:, :, t], v[:, :, t], q[:, :, t]
-            new_state = state * alpha[:, :, t].unsqueeze(-1)
-            k_state = torch.einsum('bhd,bhde->bhe', kt, new_state)
-            b_t = beta[:, :, t]
-            new_state = new_state - b_t[..., None, None] * torch.einsum('bhd,bhe->bhde', kt, k_state)
-            new_state = new_state + b_t[..., None, None] * torch.einsum('bhd,bhe->bhde', kt, vt)
-            if attention_mask is not None:
-                keep = attention_mask[:, t].view(bsz, 1, 1, 1).to(dtype=new_state.dtype)
-                new_state = keep * new_state + (1.0 - keep) * state
-            state = new_state
-            outputs[:, :, t] = torch.einsum('bhd,bhde->bhe', qt, state)
-    return outputs.to(orig_dtype), state.to(orig_dtype)
-
-
 class KimiDeltaAttention(nn.Module):
-    """Kimi-K3 KDA: independent QKVO, short conv, channel-wise forget gate, delta rule.
+    """Kimi-K3 / Kimi Linear 的 KDA：每层独立 QKVO，短卷积 + 通道遗忘门 + delta rule。
 
-    Matches the original MiniMind layer layout (each layer owns its projections) rather than
-    sharing weights with the full-attention layer.
+    布局刻意对齐原版 MiniMindBlock（每层自己的投影），不与 MLA 共享 QKVO。
+
+    数据流（每个头）::
+
+        x → Linear → ShortConv+SiLU → (Q/K 再 L2Norm)
+        α = g_min * sigmoid(exp(A) * (lowrank(x) + dt_bias))   # 有下界的通道遗忘
+        β = sigmoid(b_proj(x))                                 # delta 步长
+        S, o = WY/UT 分块扫描(q, k, v, log α, β)
+        o ← RMSNorm(o) ⊙ sigmoid(lowrank_gate(x)) → o_proj
+
+    ``past_key_value`` 存的是 RNN 状态 S 以及 Q/K/V 卷积 cache，不是 KV 序列。
     """
 
     def __init__(self, args: MiniMindConfig):
@@ -443,14 +479,21 @@ class KimiDeltaAttention(nn.Module):
         self.resid_dropout = nn.Dropout(args.dropout)
         self.gate_lower_bound = args.kda_gate_lower_bound
         self.chunk_size = args.kda_chunk_size
+        self.use_wy_scan = args.kda_use_wy_scan
+        self.context_parallel_size = args.kda_context_parallel_size
         self.attn_type = "kda"
 
     def _forget_gate(self, x: torch.Tensor):
+        """K3 带下界的通道遗忘门，输出 log 域的 α ∈ (g_min, 0)。
+
+        旧版 Linear/Mamba 常用 ``-exp(A) * softplus(z)``，值域 (-∞, 0)，长序列上容易把状态
+        乘到数值零。K3 改为 ``g = g_min * sigmoid(exp(A) * z)``，默认 ``g_min=-5``，
+        即 α ≥ exp(-5)，记忆不会被一次性清掉。
+        """
         g = self.f_b_proj(self.f_a_proj(x))
         g = g.view(*x.shape[:2], self.n_heads, self.head_dim)
         dt_bias = self.dt_bias.view(self.n_heads, self.head_dim)
         z = g.float() + dt_bias
-        # K3 lower-bounded decay: g = g_min * sigmoid(exp(A) * z) ∈ (g_min, 0)
         a_scale = self.A_log.float().exp().view(1, 1, self.n_heads, 1)
         return self.gate_lower_bound * torch.sigmoid(a_scale * z)
 
@@ -475,13 +518,15 @@ class KimiDeltaAttention(nn.Module):
         k = l2_normalize(k.view(bsz, seq_len, self.n_heads, self.head_dim)).transpose(1, 2)
         v = v.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
-        log_decay = self._forget_gate(x).transpose(1, 2)  # [B, H, T, D]
+        log_decay = self._forget_gate(x).transpose(1, 2)  # [B, H, T, D] 通道级 log α
         beta = torch.sigmoid(self.b_proj(x)).transpose(1, 2)  # [B, H, T]
         output, state = kda_delta_rule_scan(
             q, k, v, log_decay, beta,
             initial_state=recurrent_state,
             attention_mask=attention_mask,
             chunk_size=self.chunk_size,
+            use_wy_scan=self.use_wy_scan,
+            context_parallel_size=self.context_parallel_size,
         )
 
         past_kv = None
@@ -498,7 +543,8 @@ class KimiDeltaAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, config: MiniMindConfig, hidden_size: int = None, intermediate_size: int = None, use_situ: bool = False):
+    def __init__(self, config: MiniMindConfig, hidden_size: int = None, intermediate_size: int = None,
+                 use_situ: bool = False, use_qat: bool = False):
         super().__init__()
         hidden_size = config.hidden_size if hidden_size is None else hidden_size
         if intermediate_size is None:
@@ -515,19 +561,47 @@ class FeedForward(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         self.use_situ = use_situ or config.hidden_act == 'situ'
         self.act_fn = ACT2FN['silu'] if self.use_situ else ACT2FN[config.hidden_act]
-        self.situ_beta = 1.0
+        # K3 SiTU：β1=4 作用在 gate，β2=25 作用在 up；普通 SwiGLU 不走这条
+        self.situ_beta1 = float(getattr(config, 'situ_beta1', 4.0))
+        self.situ_beta2 = float(getattr(config, 'situ_beta2', 25.0))
+        self.use_qat = use_qat
+        self.qat_weight_bits = int(getattr(config, 'qat_weight_bits', 4))
+        self.qat_act_bits = int(getattr(config, 'qat_act_bits', 8))
+        self.qat_block_size = int(getattr(config, 'qat_block_size', 32))
+
+    def _linear(self, proj: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+        if not self.use_qat:
+            return proj(x)
+        return qat_linear(
+            proj, x,
+            quant_weight=True,
+            quant_act=True,
+            weight_bits=self.qat_weight_bits,
+            act_bits=self.qat_act_bits,
+            block_size=self.qat_block_size,
+        )
 
     def forward(self, x):
-        gate, up = self.gate_proj(x), self.up_proj(x)
+        gate, up = self._linear(self.gate_proj, x), self._linear(self.up_proj, x)
         if self.use_situ:
+            # SiTU(x, y) = [β1 tanh(x/β1) ⊙ σ(x)] ⊙ [β2 tanh(y/β2)]
             gate_f, up_f = gate.float(), up.float()
-            hidden = (self.situ_beta * torch.tanh(gate_f / self.situ_beta) * torch.sigmoid(gate_f) * up_f).to(x.dtype)
+            b1, b2 = self.situ_beta1, self.situ_beta2
+            hidden = (b1 * torch.tanh(gate_f / b1) * torch.sigmoid(gate_f) * (b2 * torch.tanh(up_f / b2))).to(x.dtype)
         else:
             hidden = self.act_fn(gate) * up
-        return self.dropout(self.down_proj(hidden))
+        return self.dropout(self._linear(self.down_proj, hidden) if self.use_qat else self.down_proj(hidden))
 
 
 class MoEGate(nn.Module):
+    """MoE 路由器。
+
+    - 原版 MiniMind：softmax 分数 + aux load-balancing loss。
+    - K3 Quantile Balancing：sigmoid 分数、无梯度 expert bias ``b``，用 ``s+b`` 做 Top-k，
+      混合权重仍取 **原始 s**（不含 b）。训练时
+      ``b_j ← -quantile_{1-k/n}(s_{:,j} - α)`` 再减均值；推理冻结 ``b``，不再使用 aux loss。
+    """
+
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
@@ -535,21 +609,55 @@ class MoEGate(nn.Module):
         self.n_routed_experts = config.n_routed_experts
 
         self.scoring_func = config.scoring_func
+        self.use_quantile_balancing = bool(getattr(config, 'use_quantile_balancing', False))
         self.alpha = config.aux_loss_alpha
         self.seq_aux = config.seq_aux
 
         self.norm_topk_prob = config.norm_topk_prob
         self.gating_dim = config.hidden_size
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
+        # 非训练参数：不进 Adam；eval 时保持上次更新的负荷均衡偏置
+        self.register_buffer('expert_bias', torch.zeros(self.n_routed_experts), persistent=True)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
+    def _quantile_balancing_route(self, logits: torch.Tensor):
+        # s ∈ (0,1)^{n}，排序用 s+b，权重用裸 s
+        scores = torch.sigmoid(logits.float()).type_as(logits)
+        biased = scores + self.expert_bias.to(dtype=scores.dtype)
+        k = self.top_k
+        n_exp = self.n_routed_experts
+        k_plus = min(k + 1, n_exp)
+        topk_vals, topk_idx_full = torch.topk(biased, k=k_plus, dim=-1, sorted=True)
+        topk_idx = topk_idx_full[:, :k].contiguous()
+        # α：每个 token 上第 (k+1) 大的 s+b，作为负荷均衡的截断阈值
+        alpha_cut = topk_vals[:, k - 1:k] if k_plus == k else topk_vals[:, k:k + 1]
+        topk_weight = scores.gather(-1, topk_idx)
+        if self.top_k > 1 and self.norm_topk_prob:
+            topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
+
+        if self.training and scores.shape[0] > 1:
+            with torch.no_grad():
+                residual = scores.float() - alpha_cut.float()  # [tokens, experts]
+                q = max(min(1.0 - (k / max(n_exp, 1)), 1.0), 0.0)
+                # 每个专家一列做分位数；token 太少时退回均值
+                try:
+                    bias = -torch.quantile(residual, q, dim=0)
+                except RuntimeError:
+                    bias = -residual.mean(dim=0)
+                bias = bias - bias.mean()
+                self.expert_bias.copy_(bias.to(dtype=self.expert_bias.dtype))
+        aux_loss = scores.new_zeros(1).squeeze()
+        return topk_idx, topk_weight, aux_loss
+
     def forward(self, hidden_states):
         bsz, seq_len, h = hidden_states.shape
         hidden_states = hidden_states.view(-1, h)
         logits = F.linear(hidden_states, self.weight, None)
+        if self.use_quantile_balancing or self.scoring_func in ('sigmoid', 'quantile_balancing'):
+            return self._quantile_balancing_route(logits)
         if self.scoring_func == 'softmax':
             scores = logits.softmax(dim=-1)
         else:
@@ -590,8 +698,14 @@ class MOEFeedForward(nn.Module):
         self.latent_dim = config.latent_moe_dim
         self.use_latent_moe = self.latent_dim is not None and self.latent_dim > 0
         expert_hidden = self.latent_dim if self.use_latent_moe else config.hidden_size
+        # QAT 只打在 routed expert 上，共享专家 / 路由器保持高精度
         self.experts = nn.ModuleList([
-            FeedForward(config, hidden_size=expert_hidden, use_situ=self.use_latent_moe)
+            FeedForward(
+                config,
+                hidden_size=expert_hidden,
+                use_situ=self.use_latent_moe,
+                use_qat=bool(getattr(config, 'use_qat', False)),
+            )
             for _ in range(config.n_routed_experts)
         ])
         self.gate = MoEGate(config)
@@ -659,6 +773,11 @@ class MOEFeedForward(nn.Module):
 
 
 class MiniMindBlock(nn.Module):
+    """标准 MiniMind 层：Attn/KDA/MLA + FFN/MoE。
+
+    混合模式下按 ``is_kda_layer`` 在 KDA 与 Gated MLA 之间切换；
+    ``use_attn_res`` 时残差改为 K3 的 block 级 AttnRes，而不是 x+attn+mlp。
+    """
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
         self.num_attention_heads = config.num_attention_heads
@@ -756,6 +875,7 @@ class MiniMindModel(nn.Module):
                 attention_mask: Optional[torch.Tensor] = None,
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 use_cache: bool = False,
+                vision_embeds: Optional[torch.Tensor] = None,
                 **kwargs):
         batch_size, seq_length = input_ids.shape
         if hasattr(past_key_values, 'layers'): past_key_values = None
@@ -763,6 +883,13 @@ class MiniMindModel(nn.Module):
         start_pos = infer_cache_start_pos(past_key_values)
 
         hidden_states = self.dropout(self.embed_tokens(input_ids))
+        # 视觉 token 拼在文本左侧；NTP 时这些位置的 label 在 CausalLM 里填 -100
+        if vision_embeds is not None:
+            hidden_states = torch.cat([self.dropout(vision_embeds), hidden_states], dim=1)
+            seq_length = hidden_states.shape[1]
+            if attention_mask is not None:
+                vis_mask = attention_mask.new_ones(batch_size, vision_embeds.shape[1])
+                attention_mask = torch.cat([vis_mask, attention_mask], dim=1)
 
         position_embeddings = (
             self.freqs_cos[start_pos:start_pos + seq_length],
@@ -807,6 +934,11 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self.model = MiniMindModel(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.model.embed_tokens.weight = self.lm_head.weight
+        # K3 的 MoonViT-V2 与 LLM 一起做 NTP；默认关闭以免改变纯文本 checkpoint 形状
+        self.vision_tower = None
+        if getattr(self.config, 'use_vision', False):
+            from model.model_moonvit import MoonViTV2
+            self.vision_tower = MoonViTV2(self.config)
 
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,
@@ -815,12 +947,23 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
+                pixel_values: Optional[torch.Tensor] = None,
+                pixel_values_videos: Optional[torch.Tensor] = None,
                 **args):
+        vision_embeds = None
+        if pixel_values is not None or pixel_values_videos is not None:
+            if self.vision_tower is None:
+                raise ValueError('传入了像素输入，但 config.use_vision=False，未构建 MoonViT-V2')
+            vision_embeds = self.vision_tower.encode(pixel_values, pixel_values_videos)
+            if labels is not None:
+                pad = labels.new_full((labels.size(0), vision_embeds.size(1)), -100)
+                labels = torch.cat([pad, labels], dim=1)
         hidden_states, past_key_values, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            vision_embeds=vision_embeds,
             **args
         )
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
