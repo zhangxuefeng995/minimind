@@ -33,7 +33,7 @@
 
 * 此开源项目旨在完全从0开始，仅用3块钱成本 + 2小时！即可训练出仅为25.8M的超小语言模型**MiniMind**。
 * **MiniMind**系列极其轻量，最小版本体积是 GPT-3 的 $\frac{1}{7000}$，力求做到最普通的个人GPU也可快速训练。
-* 项目同时开源了大模型的极简结构-包含拓展共享混合专家(MoE)、数据集清洗、预训练(Pretrain)、监督微调(SFT)、LoRA微调、直接偏好优化(DPO)、强化学习训练(RLAIF: PPO/GRPO等)、模型蒸馏等全过程代码。
+* 项目同时开源了大模型的极简结构-包含拓展共享混合专家(MoE)、可选的Kimi-K3风格混合注意力（3层KDA+1层MLA）、数据集清洗、预训练(Pretrain)、监督微调(SFT)、LoRA微调、直接偏好优化(DPO)、强化学习训练(RLAIF: PPO/GRPO等)、模型蒸馏等全过程代码。
 * **MiniMind**同时拓展了视觉多模态的VLM: [MiniMind-V](https://github.com/jingyaogong/minimind-v)。
 * 项目所有核心算法代码均从0使用PyTorch原生重构！不依赖第三方库提供的抽象接口。
 * 这不仅是大语言模型的全阶段开源复现，也是一个入门LLM的教程。
@@ -108,7 +108,7 @@
 
 **项目包含**
 
-- MiniMind-LLM结构的全部代码（Dense+MoE模型）。
+- MiniMind-LLM结构的全部代码（Dense+MoE模型；可选Kimi-K3风格 3 KDA + 1 MLA 混合注意力）。
 - 包含Tokenizer分词器详细训练代码。
 - 包含Pretrain、SFT、LoRA、RLHF-DPO、RLAIF(PPO/GRPO/SPO)、模型蒸馏的全过程训练代码。
 - 收集、蒸馏、整理并清洗去重所有阶段的高质量数据集，且全部开源。
@@ -124,6 +124,17 @@
 希望此开源项目可以帮助LLM初学者快速入门！
 
 ### 👉**更新日志**
+
+<details close> 
+<summary> <b>2026-09-16</b> </summary>
+
+- 新增可选 **Kimi-K3 风格混合注意力**（默认关闭，旧 GQA 权重布局不变）
+- 层排布：每组 3 层独立参数的 KDA + 1 层 Gated MLA（NoPE），最后一层强制全局注意力
+- KDA：短卷积、通道遗忘门（带下界）、delta rule；PyTorch WY/UT 分块扫描；CUDA 且已安装 Triton 时推理可走 fused recurrent，否则自动回退
+- 混合路径还可选：Block AttnRes、LatentMoE + Quantile Balancing、SiTU、routed expert QAT、Per-Head Muon、MoonViT-V2 视觉通路
+- 自检：`python tests/test_k3_hybrid_attn.py`
+
+</details>
 
 <details close> 
 <summary> <b>2025-10-24</b> </summary>
@@ -637,7 +648,36 @@ MiniMind-MoE模型，它的结构基于Llama3和[Deepseek-V2/3](https://arxiv.or
 
 ---
 
-MiniMind的整体结构一致，只是在RoPE计算、推理函数和FFN层的代码上做了一些小调整。
+### MiniMind-K3 混合注意力（可选）
+
+默认 **`use_hybrid_attn=False`**，仍是上面的 GQA Decoder-Only，与已发布的 MiniMind2 权重兼容。
+打开后按 [Kimi Linear / Kimi-K3](https://arxiv.org/abs/2510.26692) 做 **层间 3:1 混合**：三层线性注意力（KDA）接一层全局注意力（Gated MLA），最后一层始终是全局层。KDA 与 MLA **不共享 QKVO**，每层独立投影，和原版 MiniMindBlock 的「一层一套参数」一致。
+
+* **KDA（Kimi Delta Attention）**：独立 Q/K/V/O + kernel=4 因果短卷积 + Q/K L2Norm；通道级遗忘门为 K3 下界形式 `g = g_min * sigmoid(exp(A) * z)`（默认 `g_min=-5`）；递推 `S_t = (I - βkkᵀ) Diag(α) S_{t-1} + βkvᵀ`。训练用纯 PyTorch 的 WY/UT 分块扫描（与逐步递推数值对齐）；解码 `seq_len=1` 走 RNN 状态。若本机有 CUDA 且安装了 `triton`，推理可走 `model/k3_triton.py` 的 fused recurrent，未安装则自动回退，**Triton 不是硬依赖**。
+* **Gated MLA**：KV 压到 `mla_kv_lora_rank` 再展开；不做 RoPE（NoPE，位置由同组 KDA 承担）；输出带满秩 sigmoid 门。
+* **Block AttnRes**：每隔 `attn_res_block_size`（默认 4）层把前缀登记成 block 记忆，用可学习伪 query 做深度方向混合。
+* **LatentMoE**（再加 `--use_moe 1`）：路由专家在 `latent_moe_dim`（默认 `hidden/2`）上计算，SiTU 使用 `β1=4, β2=25`；共享专家仍全宽。路由默认 **Quantile Balancing**（sigmoid 分数 + 无梯度 expert bias，eval 冻结），不再用 softmax aux-loss。
+* 其它开关（均默认关）：`--use_qat 1` 只对 routed expert 做 MX 风格伪量化；`--use_per_head_muon 1` 对注意力 Q/K/V 按头 Newton–Schulz，其余 AdamW；`--use_vision 1` 启用 MiniMind 宽度的 MoonViT-V2（无 bias + RMSNorm，先空间后时间，2×2 pixel-shuffle 后投影进 LLM）。
+
+这是 MiniMind 规模的从 0 复现，**不是** 2.8T / FLA 官方 Tensor Core kernel / 多卡 1M Context Parallel / 真实 MXFP 硬件。自检：
+
+```bash
+python tests/test_k3_hybrid_attn.py
+```
+
+开启混合注意力的预训练示例（目录位于 `trainer`）：
+
+```bash
+python train_pretrain.py --use_hybrid_attn 1
+python train_pretrain.py --use_hybrid_attn 1 --use_moe 1
+python train_pretrain.py --use_hybrid_attn 1 --use_moe 1 --use_qat 1 --use_per_head_muon 1
+```
+
+`eval_llm.py`、`scripts/serve_openai_api.py` 以及其余 `trainer/train_*.py` 同样接收 `--use_hybrid_attn`。加载旧 Dense/MoE 权重时不要打开该开关。
+
+---
+
+MiniMind的整体结构一致，只是在RoPE计算、推理函数和FFN层的代码上做了一些小调整。开启混合注意力时，对应层的 self-attn 替换为 KDA 或 Gated MLA，FFN 在 hybrid+MoE 下走 LatentMoE。
 其结构如下图（重绘版）：
 
 ![structure](./images/LLM-structure.png)
@@ -768,6 +808,9 @@ LLM首先要学习的并非直接与人交流，而是让网络参数中充满�
 torchrun --nproc_per_node 1 train_pretrain.py # 1即为单卡训练，可根据硬件情况自行调整 (设置>=2)
 # or
 python train_pretrain.py
+# 可选：Kimi-K3 混合注意力（默认 0=原版 GQA；不要与旧 Dense checkpoint 混用）
+# python train_pretrain.py --use_hybrid_attn 1
+# python train_pretrain.py --use_hybrid_attn 1 --use_moe 1
 ```
 
 > 训练后的模型权重文件默认每隔`100步`保存为: `pretrain_*.pth`（*
@@ -1898,6 +1941,8 @@ python llmexport.py --path /path/to/MiniMind2/  --export mnn --hqq --dst_path Mi
 - [https://github.com/charent/ChatLM-mini-Chinese](https://github.com/charent/ChatLM-mini-Chinese)
 - [https://github.com/wdndev/tiny-llm-zh](https://github.com/wdndev/tiny-llm-zh)
 - [(Mistral-MoE)https://arxiv.org/pdf/2401.04088](https://arxiv.org/pdf/2401.04088)
+- [(Kimi Linear / KDA)https://arxiv.org/abs/2510.26692](https://arxiv.org/abs/2510.26692)
+- [https://github.com/fla-org/flash-linear-attention](https://github.com/fla-org/flash-linear-attention)
 - [https://github.com/Tongjilibo/build_MiniLLM_from_scratch](https://github.com/Tongjilibo/build_MiniLLM_from_scratch)
 - [https://github.com/jzhang38/TinyLlama](https://github.com/jzhang38/TinyLlama)
 - [https://github.com/AI-Study-Han/Zero-Chatgpt](https://github.com/AI-Study-Han/Zero-Chatgpt)
