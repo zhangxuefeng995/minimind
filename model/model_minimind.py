@@ -3,6 +3,7 @@
 # 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
 
 from transformers import PretrainedConfig
+from model.dsv41 import build_dsv41_layout
 
 
 class MiniMindConfig(PretrainedConfig):
@@ -25,6 +26,30 @@ class MiniMindConfig(PretrainedConfig):
             rope_theta: int = 1000000.0,
             inference_rope_scaling: bool = False,
             flash_attn: bool = True,
+            ####################################################
+            # DeepSeek-V4.1-Flash 风格架构（默认关闭，旧 GQA 权重布局不变）
+            # 打开后启用：CED 编解码分层、CSA2 三种注意力模式、可选 mHC / Engram / FP4 KV
+            ####################################################
+            use_dsv41: bool = False,
+            sliding_window: int = 64,
+            csa2_index_topk: int = 16,
+            csa2_index_n_heads: int = 4,
+            csa2_index_head_dim: int = 32,
+            csa2_candidate_topk_blocks: int = 8,
+            csa2_candidate_block_size: int = 4,
+            use_mhc: bool = None,
+            hc_mult: int = 2,
+            use_engram: bool = None,
+            engram_layer_ids: list = None,
+            engram_n_heads: int = 2,
+            engram_head_dim: int = 32,
+            engram_table_size: int = 1024,
+            engram_max_ngram_size: int = 3,
+            engram_pad_token_id: int = None,
+            use_fp4_kv: bool = False,
+            fp4_kv_group_size: int = 16,
+            routed_scaling_factor: float = 1.0,
+            moe_bias_update_speed: float = 0.001,
             ####################################################
             # Here are the specific configurations of MOE
             # When use_moe is false, the following is invalid
@@ -65,6 +90,38 @@ class MiniMindConfig(PretrainedConfig):
         } if self.inference_rope_scaling else None
         self.flash_attn = flash_attn
         ####################################################
+        # DeepSeek-V4.1-Flash（可选）。use_dsv41=False 时以下字段不影响 GQA 前向。
+        ####################################################
+        self.use_dsv41 = use_dsv41
+        self.sliding_window = sliding_window
+        self.csa2_index_topk = csa2_index_topk
+        self.csa2_index_n_heads = csa2_index_n_heads
+        self.csa2_index_head_dim = csa2_index_head_dim
+        self.csa2_candidate_topk_blocks = csa2_candidate_topk_blocks
+        self.csa2_candidate_block_size = csa2_candidate_block_size
+        self.use_mhc = use_dsv41 if use_mhc is None else use_mhc
+        self.hc_mult = hc_mult
+        self.use_engram = use_dsv41 if use_engram is None else use_engram
+        self.engram_n_heads = engram_n_heads
+        self.engram_head_dim = engram_head_dim
+        self.engram_table_size = engram_table_size
+        self.engram_max_ngram_size = engram_max_ngram_size
+        self.engram_pad_token_id = self.eos_token_id if engram_pad_token_id is None else engram_pad_token_id
+        self.use_fp4_kv = use_fp4_kv
+        self.fp4_kv_group_size = fp4_kv_group_size
+        self.routed_scaling_factor = routed_scaling_factor
+        self.moe_bias_update_speed = moe_bias_update_speed
+        if engram_layer_ids is None:
+            if self.use_engram and num_hidden_layers > 1:
+                engram_layer_ids = [1]
+                scaled = max(1, num_hidden_layers * 14 // 40)
+                if num_hidden_layers >= 16 and scaled not in engram_layer_ids:
+                    engram_layer_ids.append(scaled)
+            else:
+                engram_layer_ids = []
+        self.engram_layer_ids = list(engram_layer_ids)
+        self.dsv41_layout = build_dsv41_layout(num_hidden_layers) if use_dsv41 else None
+        ####################################################
         # Here are the specific configurations of MOE
         # When use_moe is false, the following is invalid
         ####################################################
@@ -72,6 +129,10 @@ class MiniMindConfig(PretrainedConfig):
         self.num_experts_per_tok = num_experts_per_tok  # 每个token选择的专家数量
         self.n_routed_experts = n_routed_experts  # 总的专家数量
         self.n_shared_experts = n_shared_experts  # 共享专家
+        # V4.1 + MoE：默认 sigmoid + 无辅助损失（expert bias 负载均衡）
+        if use_dsv41 and use_moe and scoring_func == 'softmax':
+            scoring_func = 'sigmoid'
+            aux_loss_alpha = 0.0
         self.scoring_func = scoring_func  # 评分函数，默认为'softmax'
         self.aux_loss_alpha = aux_loss_alpha  # 辅助损失的alpha参数
         self.seq_aux = seq_aux  # 是否在序列级别上计算辅助损失
@@ -91,6 +152,10 @@ from transformers.activations import ACT2FN
 from typing import Optional, Tuple, List, Union
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from model.dsv41 import (
+    CSA2Attention, EngramMemory, MHCPredictor, mhc_mix_streams,
+    infer_dsv41_start_pos, identity_gamma,
+)
 
 
 class RMSNorm(torch.nn.Module):
@@ -243,6 +308,12 @@ class MoEGate(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
         self.gating_dim = config.hidden_size
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
+        # DeepSeek-V3/V4.1 无辅助损失负载均衡：expert bias 不走反传，按负载符号更新
+        self.use_expert_bias = bool(getattr(config, 'use_dsv41', False) and config.use_moe)
+        self.bias_update_speed = float(getattr(config, 'moe_bias_update_speed', 0.001))
+        self.routed_scaling_factor = float(getattr(config, 'routed_scaling_factor', 1.0))
+        if self.use_expert_bias:
+            self.expert_bias = nn.Parameter(torch.zeros(self.n_routed_experts), requires_grad=False)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -254,14 +325,30 @@ class MoEGate(nn.Module):
         logits = F.linear(hidden_states, self.weight, None)
         if self.scoring_func == 'softmax':
             scores = logits.softmax(dim=-1)
+        elif self.scoring_func == 'sigmoid':
+            scores = logits.sigmoid()
+        elif self.scoring_func == 'sqrtsoftplus':
+            scores = F.softplus(logits).sqrt()
         else:
             raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
 
-        topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+        if self.use_expert_bias:
+            # noaux_tc：用 bias 选专家，路由权重仍取原始分数
+            topk_idx = torch.topk(scores + self.expert_bias, k=self.top_k, dim=-1, sorted=False).indices
+            topk_weight = scores.gather(-1, topk_idx)
+        else:
+            topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
 
         if self.top_k > 1 and self.norm_topk_prob:
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
+        topk_weight = topk_weight * self.routed_scaling_factor
+
+        if self.use_expert_bias and self.training:
+            with torch.no_grad():
+                counts = torch.bincount(topk_idx.view(-1), minlength=self.n_routed_experts).to(scores.dtype)
+                expected = topk_idx.numel() / float(self.n_routed_experts)
+                self.expert_bias.add_(self.bias_update_speed * torch.sign(expected - counts))
 
         if self.training and self.alpha > 0.0:
             scores_for_aux = scores
@@ -355,22 +442,59 @@ class MiniMindBlock(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.head_dim = config.hidden_size // config.num_attention_heads
-        self.self_attn = Attention(config)
+        self.self_attn = CSA2Attention(layer_id, config, config.dsv41_layout) if config.use_dsv41 else Attention(config)
 
         self.layer_id = layer_id
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+        self.use_mhc = bool(getattr(config, 'use_mhc', False) and config.use_dsv41)
+        self.use_engram = bool(config.use_dsv41 and getattr(config, 'use_engram', False)
+                               and layer_id in getattr(config, 'engram_layer_ids', []))
+        if self.use_mhc:
+            self.mhc_pred = MHCPredictor(config.hidden_size, config.hc_mult, eps=config.rms_norm_eps)
+        if self.use_engram:
+            self.engram = EngramMemory(config)
 
-    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None,
+                streams=None, mhc_gamma=None, csa2_bank=None, encoder_hidden=None, start_pos: int = 0,
+                input_ids=None):
+        if self.use_mhc and streams is not None:
+            streams = mhc_mix_streams(streams, mhc_gamma)
+            hidden_states = streams.mean(dim=2)
+
         residual = hidden_states
-        hidden_states, present_key_value = self.self_attn(
-            self.input_layernorm(hidden_states), position_embeddings,
-            past_key_value, use_cache, attention_mask
+        attn_kwargs = dict(
+            position_embeddings=position_embeddings,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            attention_mask=attention_mask,
         )
+        if self.config_is_dsv41():
+            hidden_states, present_key_value, csa2_bank = self.self_attn(
+                self.input_layernorm(hidden_states),
+                csa2_bank=csa2_bank,
+                encoder_hidden=encoder_hidden,
+                start_pos=start_pos,
+                **attn_kwargs,
+            )
+        else:
+            hidden_states, present_key_value = self.self_attn(
+                self.input_layernorm(hidden_states), **attn_kwargs
+            )
         hidden_states += residual
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
-        return hidden_states, present_key_value
+        if self.use_engram and input_ids is not None:
+            hidden_states = hidden_states + self.engram(input_ids, hidden_states)
+        next_gamma = mhc_gamma
+        if self.use_mhc and streams is not None:
+            alpha, beta, next_gamma = self.mhc_pred(streams)
+            streams = alpha * streams + beta * hidden_states.unsqueeze(2)
+            hidden_states = streams.mean(dim=2)
+        return hidden_states, present_key_value, streams, next_gamma, csa2_bank
+
+    def config_is_dsv41(self) -> bool:
+        return isinstance(self.self_attn, CSA2Attention)
 
 
 class MiniMindModel(nn.Module):
@@ -388,6 +512,11 @@ class MiniMindModel(nn.Module):
                                                     rope_scaling=config.rope_scaling)
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+        self.use_dsv41 = bool(config.use_dsv41)
+        self.use_mhc = bool(getattr(config, 'use_mhc', False) and self.use_dsv41)
+        if self.use_mhc:
+            self.mhc_stream_scale = nn.Parameter(torch.ones(config.hc_mult, 1))
+        self.n_enc = config.dsv41_layout['n_enc'] if config.dsv41_layout is not None else config.num_hidden_layers
 
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,
@@ -398,7 +527,10 @@ class MiniMindModel(nn.Module):
         batch_size, seq_length = input_ids.shape
         if hasattr(past_key_values, 'layers'): past_key_values = None
         past_key_values = past_key_values or [None] * len(self.layers)
-        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        if self.use_dsv41:
+            start_pos = infer_dsv41_start_pos(past_key_values)
+        else:
+            start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
 
         hidden_states = self.dropout(self.embed_tokens(input_ids))
 
@@ -407,21 +539,64 @@ class MiniMindModel(nn.Module):
             self.freqs_sin[start_pos:start_pos + seq_length]
         )
 
+        streams = None
+        mhc_gamma = None
+        if self.use_mhc:
+            s = self.config.hc_mult
+            streams = hidden_states.unsqueeze(2).expand(-1, -1, s, -1) * self.mhc_stream_scale.view(1, 1, s, 1)
+            mhc_gamma = identity_gamma(streams)
+
+        engram_ids = input_ids
+        if self.use_dsv41:
+            prefix = _extract_id_tail(past_key_values[0]) if past_key_values[0] is not None else None
+            if prefix is not None:
+                engram_ids = torch.cat([prefix, input_ids], dim=1)
+
         presents = []
+        encoder_hidden = None
+        csa2_bank: dict = {}
         for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
-            hidden_states, present = layer(
+            hidden_states, present, streams, mhc_gamma, csa2_bank = layer(
                 hidden_states,
                 position_embeddings,
                 past_key_value=past_key_value,
                 use_cache=use_cache,
-                attention_mask=attention_mask
+                attention_mask=attention_mask,
+                streams=streams,
+                mhc_gamma=mhc_gamma,
+                csa2_bank=csa2_bank,
+                encoder_hidden=encoder_hidden,
+                start_pos=start_pos,
+                input_ids=engram_ids,
             )
+            if self.use_dsv41 and layer_idx == self.n_enc - 1:
+                encoder_hidden = hidden_states
+            if self.use_dsv41 and use_cache and present is not None and layer_idx == 0:
+                present = _inject_id_tail(present, engram_ids, self.config.engram_max_ngram_size)
             presents.append(present)
 
         hidden_states = self.norm(hidden_states)
 
-        aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
+        aux_loss = sum(
+            [l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)],
+            hidden_states.new_zeros(1).squeeze(),
+        )
         return hidden_states, presents, aux_loss
+
+
+def _extract_id_tail(past0):
+    if past0 is None:
+        return None
+    for t in past0:
+        if torch.is_tensor(t) and t.dim() == 2 and t.dtype in (torch.long, torch.int64, torch.int32):
+            return t
+    return None
+
+
+def _inject_id_tail(present, hist_ids, max_ngram: int):
+    nkeep = max(int(max_ngram) - 1, 1)
+    tail = hist_ids[:, -nkeep:].contiguous()
+    return present[:-1] + (tail,) + present[-1:]
 
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):

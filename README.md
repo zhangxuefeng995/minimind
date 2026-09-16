@@ -33,7 +33,7 @@
 
 * 此开源项目旨在完全从0开始，仅用3块钱成本 + 2小时！即可训练出仅为25.8M的超小语言模型**MiniMind**。
 * **MiniMind**系列极其轻量，最小版本体积是 GPT-3 的 $\frac{1}{7000}$，力求做到最普通的个人GPU也可快速训练。
-* 项目同时开源了大模型的极简结构-包含拓展共享混合专家(MoE)、数据集清洗、预训练(Pretrain)、监督微调(SFT)、LoRA微调、直接偏好优化(DPO)、强化学习训练(RLAIF: PPO/GRPO等)、模型蒸馏等全过程代码。
+* 项目同时开源了大模型的极简结构-包含拓展共享混合专家(MoE)、可选的DeepSeek-V4.1风格架构（CED+CSA2+mHC+Engram）、数据集清洗、预训练(Pretrain)、监督微调(SFT)、LoRA微调、直接偏好优化(DPO)、强化学习训练(RLAIF: PPO/GRPO等)、模型蒸馏等全过程代码。
 * **MiniMind**同时拓展了视觉多模态的VLM: [MiniMind-V](https://github.com/jingyaogong/minimind-v)。
 * 项目所有核心算法代码均从0使用PyTorch原生重构！不依赖第三方库提供的抽象接口。
 * 这不仅是大语言模型的全阶段开源复现，也是一个入门LLM的教程。
@@ -108,7 +108,7 @@
 
 **项目包含**
 
-- MiniMind-LLM结构的全部代码（Dense+MoE模型）。
+- MiniMind-LLM结构的全部代码（Dense+MoE模型；可选 DeepSeek-V4.1 风格 CED + CSA2）。
 - 包含Tokenizer分词器详细训练代码。
 - 包含Pretrain、SFT、LoRA、RLHF-DPO、RLAIF(PPO/GRPO/SPO)、模型蒸馏的全过程训练代码。
 - 收集、蒸馏、整理并清洗去重所有阶段的高质量数据集，且全部开源。
@@ -124,6 +124,20 @@
 希望此开源项目可以帮助LLM初学者快速入门！
 
 ### 👉**更新日志**
+
+<details close> 
+<summary> <b>2026-09-16</b> </summary>
+
+- 新增可选 **DeepSeek-V4.1-Flash 风格架构**（默认关闭，旧 GQA 权重布局不变）
+- **CED**：层数对半，前半因果编码器、后半解码器；解码器 Full 层的全局 KV 从编码器出口投影
+- **CSA2**：每层静态 Full / Reindex / Reuse；局部 SWA + 跨层共享主 KV；解码器 Hierarchical Sparse Indexer
+- **SWA Bounded Replay**：推理只保留最近 `sliding_window` 个局部 KV
+- **Single-Pass mHC**：多残差流，混合系数错位一层
+- **Engram**：n-gram 哈希条件记忆；**FP4 主 KV**（E2M1，可选 STE 伪量化）
+- MoE 打开时走 sigmoid + 无梯度 expert bias（noaux_tc），不再加 aux-loss
+- 自检：`python tests/test_dsv41_arch.py`
+
+</details>
 
 <details close> 
 <summary> <b>2025-10-24</b> </summary>
@@ -637,7 +651,40 @@ MiniMind-MoE模型，它的结构基于Llama3和[Deepseek-V2/3](https://arxiv.or
 
 ---
 
-MiniMind的整体结构一致，只是在RoPE计算、推理函数和FFN层的代码上做了一些小调整。
+### MiniMind-DeepSeek-V4.1（可选）
+
+默认 **`use_dsv41=False`**，仍是上面的 GQA Decoder-Only，与已发布的 MiniMind2 权重兼容。
+打开后按 [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) 做 **MiniMind 尺度**复现（不是 552B / 1M 上下文 / 官方 kernel）。
+
+* **CED（Causal Encoder-Decoder）**：`n_layers` 对半切开。前半是因果编码器，后半是解码器。解码器里负责写全局 KV 的 Full 层从**编码器最后一层隐状态**投影，而不是从本层 hidden 再算一遍。论文用这个把 prefill 激活量降到 decode 的一半（官方 8B / 16B）。
+* **CSA2（Compressed Sparse Attention 2）**：每层静态三种模式之一。**Full** 计算主 KV、indexer K 和新的 Top-K；**Reindex** 复用最近 Full 的主 KV / indexer K，只用本层 indexer Q 重打分；**Reuse** 连 Top-K 下标一起复用。三种模式都保留本层 Q 和局部 SWA KV。编码器 CSA2 压缩比 2（非重叠池化，去掉 CSA 的重叠与压缩端绝对位置）；解码器压缩比 1。闪电 indexer 为 `ReLU(q·k)` 加权求和。
+* **Hierarchical Sparse Indexer**：解码器第一个 Full 层对全上下文打分，再按 block 取 max 组成候选池；后续 Reindex 只在池内选 Top-K，打分代价与上下文长度解耦。
+* **SWA Bounded Replay**：推理 cache 只保留最近 `sliding_window` 个局部 KV（官方 128，这里默认 64），避免把整段 SWA 写到慢存储。
+* **Single-Pass mHC**：`hc_mult` 条残差流；输入混合使用**上一层**的 γ，系数预测与残差更新可以一次做完。
+* **Engram**：词表哈希 + 多头 n-gram 查表 + 上下文门控（V4.1 去掉短卷积）。默认插在第 1 层（更深模型再按 40 层比例加一层）。
+* **FP4 主 KV**：`--use_fp4_kv 1` 时对全局 KV 做 E2M1、每 16 通道一个 scale 的 STE 伪量化；SWA KV 保持原精度。
+* **DeepSeekMoE**：`--use_dsv41 1 --use_moe 1` 时路由改为 sigmoid + 无梯度 expert bias（noaux_tc），`aux_loss=0`。
+* **DSpark**：论文在骨干预训练之后单独训投机解码，骨干前向不包含草稿网络，这里同样省略。
+
+这是教学级实现：**不是** 384 专家 / FP8 权重 / 1M Context Parallel / Mega-mHC 融合核。自检：
+
+```bash
+python tests/test_dsv41_arch.py
+```
+
+开启 V4.1 架构的预训练示例（目录位于 `trainer`）：
+
+```bash
+python train_pretrain.py --use_dsv41 1
+python train_pretrain.py --use_dsv41 1 --use_moe 1
+python train_pretrain.py --use_dsv41 1 --use_fp4_kv 1
+```
+
+`eval_llm.py`、`scripts/serve_openai_api.py` 以及其余 `trainer/train_*.py` 同样接收 `--use_dsv41`。加载旧 Dense/MoE 权重时不要打开该开关。
+
+---
+
+MiniMind的整体结构一致，只是在RoPE计算、推理函数和FFN层的代码上做了一些小调整。开启 `--use_dsv41` 时，对应层的 self-attn 替换为 CSA2（前两层纯 SWA），并套上 CED / mHC / Engram。
 其结构如下图（重绘版）：
 
 ![structure](./images/LLM-structure.png)
@@ -768,6 +815,9 @@ LLM首先要学习的并非直接与人交流，而是让网络参数中充满�
 torchrun --nproc_per_node 1 train_pretrain.py # 1即为单卡训练，可根据硬件情况自行调整 (设置>=2)
 # or
 python train_pretrain.py
+# 可选：DeepSeek-V4.1 风格架构（默认 0=原版 GQA；不要与旧 Dense checkpoint 混用）
+# python train_pretrain.py --use_dsv41 1
+# python train_pretrain.py --use_dsv41 1 --use_moe 1
 ```
 
 > 训练后的模型权重文件默认每隔`100步`保存为: `pretrain_*.pth`（*
@@ -1895,6 +1945,7 @@ python llmexport.py --path /path/to/MiniMind2/  --export mnn --hqq --dst_path Mi
 - [https://github.com/karpathy/llama2.c](https://github.com/karpathy/llama2.c)
 - [https://github.com/DLLXW/baby-llama2-chinese](https://github.com/DLLXW/baby-llama2-chinese)
 - [(DeepSeek-V2)https://arxiv.org/abs/2405.04434](https://arxiv.org/abs/2405.04434)
+- [(DeepSeek-V4.1-Flash)https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
 - [https://github.com/charent/ChatLM-mini-Chinese](https://github.com/charent/ChatLM-mini-Chinese)
 - [https://github.com/wdndev/tiny-llm-zh](https://github.com/wdndev/tiny-llm-zh)
 - [(Mistral-MoE)https://arxiv.org/pdf/2401.04088](https://arxiv.org/pdf/2401.04088)

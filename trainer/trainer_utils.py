@@ -15,6 +15,34 @@ from torch.utils.data import Sampler
 from transformers import AutoTokenizer
 from model.model_minimind import MiniMindForCausalLM
 
+DSV41_ARG_HELP = "是否启用DeepSeek-V4.1风格架构（CED+CSA2+mHC+Engram；默认0，旧GQA权重布局不变）"
+
+
+def add_dsv41_args(parser):
+    parser.add_argument('--use_dsv41', default=0, type=int, choices=[0, 1], help=DSV41_ARG_HELP)
+    parser.add_argument('--use_fp4_kv', default=0, type=int, choices=[0, 1],
+                        help="是否对 CSA2 全局 KV 做 E2M1/FP4 伪量化（仅 use_dsv41=1 时有意义）")
+    parser.add_argument('--use_mhc', default=-1, type=int, choices=[-1, 0, 1],
+                        help="Single-Pass mHC（-1=跟随 use_dsv41，0=关，1=开）")
+    parser.add_argument('--use_engram', default=-1, type=int, choices=[-1, 0, 1],
+                        help="Engram 条件记忆（-1=跟随 use_dsv41，0=关，1=开）")
+    parser.add_argument('--sliding_window', default=64, type=int, help="CSA2/SWA 窗口长度（官方 128，MiniMind 默认 64）")
+
+
+def dsv41_kwargs(args):
+    kwargs = dict(use_dsv41=bool(getattr(args, 'use_dsv41', 0)))
+    if hasattr(args, 'use_fp4_kv'):
+        kwargs['use_fp4_kv'] = bool(args.use_fp4_kv)
+    if hasattr(args, 'sliding_window'):
+        kwargs['sliding_window'] = int(args.sliding_window)
+    use_mhc = getattr(args, 'use_mhc', -1)
+    if use_mhc != -1:
+        kwargs['use_mhc'] = bool(use_mhc)
+    use_engram = getattr(args, 'use_engram', -1)
+    if use_engram != -1:
+        kwargs['use_engram'] = bool(use_engram)
+    return kwargs
+
 def get_model_params(model, config):
     total = sum(p.numel() for p in model.parameters()) / 1e6
     n_routed = getattr(config, 'n_routed_experts', getattr(config, 'num_experts', 0))
