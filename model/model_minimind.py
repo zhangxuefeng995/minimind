@@ -153,7 +153,7 @@ from typing import Optional, Tuple, List, Union
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from model.dsv41 import (
-    CSA2Attention, EngramMemory, MHCPredictor, mhc_mix_streams,
+    CSA2Attention, build_csa2_attn, EngramMemory, MHCPredictor, mhc_mix_streams,
     infer_dsv41_start_pos, identity_gamma,
 )
 
@@ -442,7 +442,9 @@ class MiniMindBlock(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.head_dim = config.hidden_size // config.num_attention_heads
-        self.self_attn = CSA2Attention(layer_id, config, config.dsv41_layout) if config.use_dsv41 else Attention(config)
+        self.self_attn = (
+            build_csa2_attn(layer_id, config, config.dsv41_layout) if config.use_dsv41 else Attention(config)
+        )
 
         self.layer_id = layer_id
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

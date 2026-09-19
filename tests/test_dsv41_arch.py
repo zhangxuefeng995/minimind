@@ -5,7 +5,10 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import torch
-from model.dsv41 import CEDDecoderKV, build_dsv41_layout, fake_quant_fp4_e2m1, compress_tokens
+from model.dsv41 import (
+    CEDDecoderKV, CSA2DecoderAttention, CSA2EncoderAttention,
+    build_dsv41_layout, fake_quant_fp4_e2m1, compress_tokens,
+)
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM, Attention
 
 
@@ -70,11 +73,17 @@ def test_default_gqa_unchanged():
     assert out.logits.shape == (2, 7, 32)
 
 
-def test_decoder_full_kv_is_single_linear():
+def test_encoder_decoder_attn_split():
     cfg = _tiny_cfg()
     model = MiniMindForCausalLM(cfg)
     n_enc = cfg.dsv41_layout['n_enc']
     modes = cfg.dsv41_layout['modes']
+    for i, layer in enumerate(model.model.layers):
+        if i < n_enc:
+            assert isinstance(layer.self_attn, CSA2EncoderAttention)
+            assert not isinstance(layer.self_attn, CSA2DecoderAttention)
+        else:
+            assert isinstance(layer.self_attn, CSA2DecoderAttention)
     enc_full = next(i for i, m in enumerate(modes) if m == 'full' and i < n_enc)
     dec_full = next(i for i, m in enumerate(modes) if m == 'full' and i >= n_enc)
     enc_attn = model.model.layers[enc_full].self_attn
@@ -147,7 +156,7 @@ def test_generate_smoke():
 if __name__ == '__main__':
     tests = [
         test_layout_8_and_40,
-        test_decoder_full_kv_is_single_linear,
+        test_encoder_decoder_attn_split,
         test_default_gqa_unchanged,
         test_dsv41_forward_and_backward,
         test_dsv41_moe_noaux,

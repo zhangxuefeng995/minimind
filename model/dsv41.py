@@ -343,10 +343,11 @@ class CEDDecoderKV(nn.Module):
 
 
 class CSA2Attention(nn.Module):
-    """Compressed Sparse Attention 2：局部 SWA + 跨层共享的稀疏全局 KV。
+    """CSA2 公共部分：Q + 局部 SWA + 稀疏拼 softmax。
 
-    编码器 Full：k_proj + v_proj 再池化；解码器 Full：独立 CEDDecoderKV（一个 Linear）。
+    编码器 / 解码器是两个子类，组网时按层选用，不要直接实例化本类。
     """
+    is_decoder = False
 
     def __init__(self, layer_id: int, config, layout: Dict):
         super().__init__()
@@ -370,8 +371,6 @@ class CSA2Attention(nn.Module):
         self.use_fp4_kv = bool(getattr(config, 'use_fp4_kv', False))
         self.fp4_group = int(getattr(config, 'fp4_kv_group_size', 16))
         self.dropout = config.dropout
-        # 解码器 Full：全局 KV 来自编码器出口，而不是本层 hidden（CED）
-        self.use_encoder_kv = (self.mode == 'full' and layer_id >= self.n_enc)
 
         self.q_proj = nn.Linear(config.hidden_size, self.n_heads * self.head_dim, bias=False)
         self.swa_k_proj = nn.Linear(config.hidden_size, self.n_kv * self.head_dim, bias=False)
@@ -380,19 +379,24 @@ class CSA2Attention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
+        kv_dim = self.n_kv * self.head_dim
         if self.mode == 'full':
-            kv_dim = self.n_kv * self.head_dim
-            if self.use_encoder_kv:
-                self.dec_kv = CEDDecoderKV(config.hidden_size, kv_dim)
-            else:
-                self.k_proj = nn.Linear(config.hidden_size, kv_dim, bias=False)
-                self.v_proj = nn.Linear(config.hidden_size, kv_dim, bias=False)
+            self._init_main_kv(config, kv_dim)
             self.indexer_q_proj = nn.Linear(config.hidden_size, self.index_n_heads * self.index_head_dim, bias=False)
             self.indexer_k_proj = nn.Linear(kv_dim, self.index_n_heads * self.index_head_dim, bias=False)
             self.indexer_w = nn.Parameter(torch.ones(self.index_n_heads))
         elif self.mode == 'reindex':
             self.indexer_q_proj = nn.Linear(config.hidden_size, self.index_n_heads * self.index_head_dim, bias=False)
             self.indexer_w = nn.Parameter(torch.ones(self.index_n_heads))
+
+    def _init_main_kv(self, config, kv_dim: int):
+        raise NotImplementedError
+
+    def _main_kv_src(self, x, encoder_hidden):
+        return x
+
+    def _project_main_kv(self, src, bsz, seq_len):
+        raise NotImplementedError
 
     def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, n_kv, D] → [B, T, n_heads, D]
@@ -503,17 +507,11 @@ class CSA2Attention(nn.Module):
         topk_idx = bank.get('topk')
 
         if self.mode == 'full':
-            src = encoder_hidden if (self.use_encoder_kv and encoder_hidden is not None) else x
+            src = self._main_kv_src(x, encoder_hidden)
             if src.size(1) != seq_len:
                 # 编码器隐状态应与当前 chunk 对齐；多出来的历史走 cache
                 src = src[:, -seq_len:, :]
-            if self.use_encoder_kv:
-                mk, mv = self.dec_kv(src)
-                mk = mk.view(bsz, seq_len, self.n_kv, self.head_dim)
-                mv = mv.view(bsz, seq_len, self.n_kv, self.head_dim)
-            else:
-                mk = self.k_proj(src).view(bsz, seq_len, self.n_kv, self.head_dim)
-                mv = self.v_proj(src).view(bsz, seq_len, self.n_kv, self.head_dim)
+            mk, mv = self._project_main_kv(src, bsz, seq_len)
             mk = apply_rope(mk, cos, sin)
             if past_mk is not None:
                 mk = torch.cat([past_mk, mk], dim=1)
@@ -547,7 +545,7 @@ class CSA2Attention(nn.Module):
                 raise RuntimeError(f'CSA2 {self.mode} 层 {self.layer_id} 没有可用的共享 main KV，请检查 Full 层布局')
             if self.mode == 'reindex':
                 indexer_q = self.indexer_q_proj(x).view(bsz, seq_len, self.index_n_heads, self.index_head_dim)
-                pool = bank.get('candidate_pool') if self.layer_id >= self.n_enc else None
+                pool = bank.get('candidate_pool') if self.is_decoder else None
                 ratio = max(self.compress_ratio, 1)
                 end_pos = (torch.arange(main_k.size(1), device=x.device) + 1) * ratio - 1
                 if pool is not None:
@@ -604,6 +602,43 @@ class CSA2Attention(nn.Module):
         if mk is None:
             return (swa_k, swa_v, seq_t)
         return (swa_k, swa_v, mk, mv, seq_t)
+
+
+class CSA2EncoderAttention(CSA2Attention):
+    """编码器 CSA2：全局 KV 从本层 hidden 做 k/v 双投影，再按 compress_ratio 池化。"""
+    is_decoder = False
+
+    def _init_main_kv(self, config, kv_dim: int):
+        self.k_proj = nn.Linear(config.hidden_size, kv_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, kv_dim, bias=False)
+
+    def _project_main_kv(self, src, bsz, seq_len):
+        mk = self.k_proj(src).view(bsz, seq_len, self.n_kv, self.head_dim)
+        mv = self.v_proj(src).view(bsz, seq_len, self.n_kv, self.head_dim)
+        return mk, mv
+
+
+class CSA2DecoderAttention(CSA2Attention):
+    """解码器 CSA2：全局 KV 只用 CEDDecoderKV（一个 Linear），源是编码器出口。"""
+    is_decoder = True
+
+    def _init_main_kv(self, config, kv_dim: int):
+        self.dec_kv = CEDDecoderKV(config.hidden_size, kv_dim)
+
+    def _main_kv_src(self, x, encoder_hidden):
+        return encoder_hidden if encoder_hidden is not None else x
+
+    def _project_main_kv(self, src, bsz, seq_len):
+        mk, mv = self.dec_kv(src)
+        mk = mk.view(bsz, seq_len, self.n_kv, self.head_dim)
+        mv = mv.view(bsz, seq_len, self.n_kv, self.head_dim)
+        return mk, mv
+
+
+def build_csa2_attn(layer_id: int, config, layout: Dict) -> CSA2Attention:
+    """前半层编码器注意力，后半层解码器注意力。"""
+    cls = CSA2DecoderAttention if layer_id >= layout['n_enc'] else CSA2EncoderAttention
+    return cls(layer_id, config, layout)
 
 
 def infer_dsv41_start_pos(past_key_values) -> int:
