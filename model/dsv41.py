@@ -326,8 +326,27 @@ class EngramMemory(nn.Module):
         return gate * retrieved
 
 
+class CEDDecoderKV(nn.Module):
+    """CED 解码器 Full 的全局 KV：编码器出口 → 一次 Linear。
+
+    官方 Compressor 在 compress_ratio=1 时不做门控池化，只保留 ``wkv``。
+    从 CSA2Attention 拆出，避免解码器再挂编码器的 k/v 双投影。
+    """
+
+    def __init__(self, hidden_size: int, kv_dim: int):
+        super().__init__()
+        self.proj = nn.Linear(hidden_size, kv_dim * 2, bias=False)
+
+    def forward(self, encoder_hidden: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        k, v = self.proj(encoder_hidden).chunk(2, dim=-1)
+        return k, v
+
+
 class CSA2Attention(nn.Module):
-    """Compressed Sparse Attention 2：局部 SWA + 跨层共享的稀疏全局 KV。"""
+    """Compressed Sparse Attention 2：局部 SWA + 跨层共享的稀疏全局 KV。
+
+    编码器 Full 用 k/v 双投影 + 池化；解码器 Full 只用 :class:`CEDDecoderKV`。
+    """
 
     def __init__(self, layer_id: int, config, layout: Dict):
         super().__init__()
@@ -362,10 +381,14 @@ class CSA2Attention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
 
         if self.mode == 'full':
-            self.k_proj = nn.Linear(config.hidden_size, self.n_kv * self.head_dim, bias=False)
-            self.v_proj = nn.Linear(config.hidden_size, self.n_kv * self.head_dim, bias=False)
+            kv_dim = self.n_kv * self.head_dim
+            if self.use_encoder_kv:
+                self.dec_kv = CEDDecoderKV(config.hidden_size, kv_dim)
+            else:
+                self.k_proj = nn.Linear(config.hidden_size, kv_dim, bias=False)
+                self.v_proj = nn.Linear(config.hidden_size, kv_dim, bias=False)
             self.indexer_q_proj = nn.Linear(config.hidden_size, self.index_n_heads * self.index_head_dim, bias=False)
-            self.indexer_k_proj = nn.Linear(self.n_kv * self.head_dim, self.index_n_heads * self.index_head_dim, bias=False)
+            self.indexer_k_proj = nn.Linear(kv_dim, self.index_n_heads * self.index_head_dim, bias=False)
             self.indexer_w = nn.Parameter(torch.ones(self.index_n_heads))
         elif self.mode == 'reindex':
             self.indexer_q_proj = nn.Linear(config.hidden_size, self.index_n_heads * self.index_head_dim, bias=False)
@@ -484,8 +507,13 @@ class CSA2Attention(nn.Module):
             if src.size(1) != seq_len:
                 # 编码器隐状态应与当前 chunk 对齐；多出来的历史走 cache
                 src = src[:, -seq_len:, :]
-            mk = self.k_proj(src).view(bsz, seq_len, self.n_kv, self.head_dim)
-            mv = self.v_proj(src).view(bsz, seq_len, self.n_kv, self.head_dim)
+            if self.use_encoder_kv:
+                mk, mv = self.dec_kv(src)
+                mk = mk.view(bsz, seq_len, self.n_kv, self.head_dim)
+                mv = mv.view(bsz, seq_len, self.n_kv, self.head_dim)
+            else:
+                mk = self.k_proj(src).view(bsz, seq_len, self.n_kv, self.head_dim)
+                mv = self.v_proj(src).view(bsz, seq_len, self.n_kv, self.head_dim)
             mk = apply_rope(mk, cos, sin)
             if past_mk is not None:
                 mk = torch.cat([past_mk, mk], dim=1)
