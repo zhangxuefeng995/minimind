@@ -345,7 +345,7 @@ class CEDDecoderKV(nn.Module):
 class CSA2Attention(nn.Module):
     """Compressed Sparse Attention 2：局部 SWA + 跨层共享的稀疏全局 KV。
 
-    编码器 Full 用 k/v 双投影 + 池化；解码器 Full 只用 :class:`CEDDecoderKV`。
+    编码器 Full：k_proj + v_proj 再池化；解码器 Full：独立 CEDDecoderKV（一个 Linear）。
     """
 
     def __init__(self, layer_id: int, config, layout: Dict):
